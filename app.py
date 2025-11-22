@@ -8,7 +8,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. 系統設定
+# 1. 系統設定與 CSS
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Guardian Ultimate", layout="wide", page_icon="🛡️")
 
@@ -83,7 +83,6 @@ def detect_industry_type(info):
     industry = info.get('industry', '')
     summary = info.get('longBusinessSummary', '')
     
-    # ETF 判斷 (如果沒有 sector 但有名稱)
     short_name = info.get('shortName', '')
     if 'ETF' in short_name or 'Dividend' in short_name:
         return 'ETF'
@@ -165,7 +164,6 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
             report['score'] -= 10
             report['details'].append(("[訊號] KD低檔", "嚴重超賣。"))
 
-    # 選股模式下，假設買入價=現價
     if buy_price > 0:
         user_stop_price = buy_price * (1 - stop_loss_pct / 100)
         if current_close <= user_stop_price:
@@ -304,14 +302,13 @@ def dashboard_page():
             st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 頁面 B: 智慧選股雷達
+# 4. 頁面 B: 智慧選股雷達 (擴充版)
 # ---------------------------------------------------------
 def scanner_page():
-    st.title("🎯 智慧選股雷達 (擴充版)")
+    st.title("🎯 智慧選股雷達")
     st.markdown("### AI 自動掃描 30 檔熱門股")
     st.info("💡 掃描時間約需 40~60 秒，請耐心等候。綠色越多代表市場越好，紅色越多代表市場在休息。")
     
-    # 分類觀察名單
     watchlist_groups = {
         "🤖 AI 半導體": {
             "台積電": "2330.TW", "聯發科": "2454.TW", "鴻海": "2317.TW", "廣達": "2382.TW", 
@@ -332,7 +329,6 @@ def scanner_page():
     }
     
     if st.button("🚀 開始掃描"):
-        # 扁平化清單以便跑迴圈
         full_list = []
         for category, items in watchlist_groups.items():
             for name, ticker in items.items():
@@ -347,8 +343,6 @@ def scanner_page():
                 if df is not None:
                     detected = detect_industry_type(info)
                     mode = "Cycle" if detected or "ETF" in category else "Trend"
-                    
-                    # ETF 強制設為 Trend 或 Cycle 依屬性，這裡簡化邏輯
                     if "ETF" in category: mode = "Trend" 
                     
                     current_price = df['Close'].iloc[-1]
@@ -361,6 +355,7 @@ def scanner_page():
                     
                     results.append({
                         "分類": category,
+                        "代號": ticker.replace(".TW", ""), # 新增代號欄位
                         "股票": name,
                         "現價": f"{current_price:.1f}",
                         "分數": report['score'],
@@ -369,7 +364,7 @@ def scanner_page():
                         "籌碼": report['obv_trend']
                     })
             except:
-                pass # 跳過錯誤的股票
+                pass
             
             progress_bar.progress((i + 1) / len(full_list))
             
@@ -377,7 +372,7 @@ def scanner_page():
         
         if results:
             res_df = pd.DataFrame(results)
-            res_df = res_df.sort_values(by="分數") # 分數低 (安全) 的排前面
+            res_df = res_df.sort_values(by="分數")
             
             st.dataframe(
                 res_df,
