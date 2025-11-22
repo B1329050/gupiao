@@ -11,13 +11,12 @@ from datetime import datetime
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Analysis System", layout="wide")
 
-# CSS 設定：建立清晰的紅綠文字風格，不使用圖示
+# CSS 設定：建立清晰的紅綠文字風格
 st.markdown("""
     <style>
-    .status-danger { color: #D32F2F; font-weight: bold; }
-    .status-safe { color: #388E3C; font-weight: bold; }
-    .status-neutral { color: #F57C00; font-weight: bold; }
-    .metric-value { font-size: 1.2rem; font-weight: bold; }
+    .status-danger { color: #D32F2F; font-weight: bold; font-size: 1.1rem; }
+    .status-safe { color: #388E3C; font-weight: bold; font-size: 1.1rem; }
+    .status-neutral { color: #F57C00; font-weight: bold; font-size: 1.1rem; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -43,7 +42,7 @@ def get_stock_data(ticker):
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['MA120'] = df['Close'].rolling(window=120).mean()
         
-        # KD 指標 (Stochastic Oscillator)
+        # KD 指標
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=9, smooth_window=3)
         df['K'] = stoch.stoch()
         df['D'] = stoch.stoch_signal()
@@ -56,15 +55,15 @@ def get_stock_data(ticker):
         
         return df, info
     except Exception as e:
-        st.error(f"System Error: {e}")
         return None, None
 
 # ---------------------------------------------------------
-# 產業判斷邏輯
+# 產業判斷邏輯 (修正版：優先檢查產業欄位)
 # ---------------------------------------------------------
 def detect_industry_type(info):
     """
     判斷股票屬性：景氣循環股 vs 一般趨勢股
+    修正：優先檢查 Sector/Industry，避免因簡介內容導致誤判
     """
     sector = info.get('sector', '')
     industry = info.get('industry', '')
@@ -73,23 +72,25 @@ def detect_industry_type(info):
     # 循環型產業關鍵字清單
     cycle_keywords = [
         'Semiconductors', 'Memory', 'DRAM', 'Flash', # 記憶體
+        'Marine', 'Shipping', 'Freight', 'Transport', # 航運
         'Steel', 'Iron', 'Metal', # 鋼鐵
-        'Marine', 'Shipping', 'Transport', # 航運
         'Chemical', 'Oil', 'Petroleum', # 塑化
         'Panel', 'Display', 'LCD' # 面板
     ]
     
-    detected_keyword = None
-    
-    # 搜尋配對
-    text_to_search = (str(sector) + " " + str(industry) + " " + str(summary)).lower()
-    
+    # 策略 1：優先檢查「產業」與「板塊」欄位 (最準確)
+    primary_check = (str(sector) + " " + str(industry)).lower()
     for kw in cycle_keywords:
-        if kw.lower() in text_to_search:
-            detected_keyword = kw
-            break
+        if kw.lower() in primary_check:
+            return kw # 找到就直接回傳
             
-    return detected_keyword
+    # 策略 2：如果產業欄位沒寫，才去檢查「簡介」
+    summary_check = str(summary).lower()
+    for kw in cycle_keywords:
+        if kw.lower() in summary_check:
+            return kw
+            
+    return None
 
 # ---------------------------------------------------------
 # 核心分析邏輯
@@ -113,8 +114,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         "action": "觀望 / 持有",
         "details": [],
         "atr_stop_price": 0.0,
-        "trailing_stop_price": 0.0,
-        "is_danger": False
+        "trailing_stop_price": 0.0
     }
 
     # 計算 ATR 動態停損價 (收盤價 - 2倍 ATR)
@@ -179,7 +179,6 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     if current_close <= user_stop_price:
         report['details'].append(f"[強制停損] 觸及您設定的虧損極限 (-{stop_loss_pct}%)，價格低於 {user_stop_price:.2f}。")
         report['score'] = 100
-        report['is_danger'] = True
 
     # 移動停利 (Trailing Stop)
     if use_trailing:
@@ -193,7 +192,6 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         if current_close < trailing_stop_price:
             report['details'].append(f"[停利訊號] 股價已從波段高點({recent_high:.2f}) 回檔超過 10%，建議獲利了結。")
             report['score'] = 100
-            report['is_danger'] = True
         else:
             report['details'].append(f"[監控中] 移動停利點為 {trailing_stop_price:.2f} (高點 {recent_high:.2f} 之 90%)。")
 
@@ -218,7 +216,7 @@ def main():
     # 2. 買入多少錢
     buy_price = st.sidebar.number_input("買入成本 (每股單價)", value=60.0, step=0.1)
     
-    # 3. 買了多少股 (新增功能)
+    # 3. 買了多少股
     shares_held = st.sidebar.number_input("持有股數 (例如: 5張請輸入 5000)", value=1000, step=1000)
     
     # 4. 停損設定
@@ -271,7 +269,7 @@ def main():
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("當前股價", f"{current_price:.2f}", f"{change:.2f} ({change_pct:.2f}%)")
     col2.metric("總報酬率 (%)", f"{pl_pct:.2f}%", delta_color="normal")
-    col3.metric("總損益金額 (TWD)", f"{int(pl_amount):,}", delta_color="normal") # 加千分位逗號
+    col3.metric("總損益金額 (TWD)", f"{int(pl_amount):,}", delta_color="normal")
     col4.metric("風險評分 (0-100)", f"{report['score']}")
 
     st.divider()
@@ -290,9 +288,10 @@ def main():
     for detail in report['details']:
         st.text(f"• {detail}")
 
-    # 定存比較 (修正為總金額計算)
+    # 定存比較
     if pl_amount < 0:
         deposit_rate = 0.017
+        # 修正邏輯：使用總投入本金計算
         deposit_loss_years = abs(pl_amount) / (total_cost * deposit_rate)
         st.markdown(f"**機會成本換算**：目前的虧損金額 ({int(abs(pl_amount)):,} 元)，等同於損失了該筆本金 **{deposit_loss_years:.1f} 年** 的定存利息。")
 
