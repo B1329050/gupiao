@@ -8,47 +8,49 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. 系統設定與 CSS
+# 1. 系統設定與 CSS (修復排版與字體大小)
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Guardian Ultimate", layout="wide", page_icon="🛡️")
 
 st.markdown("""
     <style>
-    /* 風險訊號樣式 */
+    /* 風險訊號 */
     .status-danger { 
-        color: #D32F2F; font-weight: bold; font-size: 1.3rem; 
+        color: #D32F2F; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFEBEE; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #D32F2F; margin-bottom: 10px;
     }
+    /* 安全訊號 */
     .status-safe { 
-        color: #2E7D32; font-weight: bold; font-size: 1.3rem; 
+        color: #2E7D32; font-weight: bold; font-size: 1.2rem; 
         background-color: #E8F5E9; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #2E7D32; margin-bottom: 10px;
     }
+    /* 中性訊號 */
     .status-neutral { 
-        color: #EF6C00; font-weight: bold; font-size: 1.3rem; 
+        color: #EF6C00; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFF3E0; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #EF6C00; margin-bottom: 10px;
     }
     .explanation-text { font-size: 1rem; color: #444; margin-left: 5px; line-height: 1.5; }
     
-    /* 懸停提示字詞樣式 (Tooltip) */
-    abbr {
-        text-decoration: underline dotted #0066cc; 
-        cursor: help;
+    /* 強制調整 Metric 字體大小，避免被切掉 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.4rem !important;
+    }
+    
+    /* 說明書的藍色解釋文字 */
+    .tooltip-text {
         color: #0066cc;
         font-weight: bold;
+        text-decoration: underline dotted;
+        cursor: help;
     }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 懸停提示小工具 ---
-def tooltip(text, desc):
-    """產生帶有懸停解釋的 HTML 標籤"""
-    return f'<abbr title="{desc}">{text}</abbr>'
-
 # ---------------------------------------------------------
-# 2. 資料獲取與運算
+# 2. 資料獲取
 # ---------------------------------------------------------
 @st.cache_data(ttl=900)
 def get_stock_data(ticker):
@@ -58,15 +60,14 @@ def get_stock_data(ticker):
         if df.empty: return None, None
         info = stock.info
 
-        # 基礎指標
+        # 基礎
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
         
-        # 進階指標
+        # 進階
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=9, smooth_window=3)
-        df['K'] = stoch.stoch() # KD指標中的K值
-        
+        df['K'] = stoch.stoch()
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
@@ -99,7 +100,6 @@ def detect_industry_type(info):
     return None
 
 def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailing):
-    # 取得最新數據
     current_close = df['Close'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
     ma60 = df['MA60'].iloc[-1]
@@ -107,8 +107,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     rsi = df['RSI'].iloc[-1]
     mfi = df['MFI'].iloc[-1]
     bias = df['Bias'].iloc[-1]
-    k_val = df['K'].iloc[-1] 
-    
+    k_val = df['K'].iloc[-1]
     pb_ratio = info.get('priceToBook', None)
     
     price_change_5d = current_close - df['Close'].iloc[-5]
@@ -119,23 +118,24 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         "atr_stop_price": current_close - (2.0 * atr), "trailing_stop_price": 0.0, "obv_trend": "持平"
     }
     
-    if obv_change_5d > 0: report['obv_trend'] = "上升 (資金流入)"
-    elif obv_change_5d < 0: report['obv_trend'] = "下降 (資金流出)"
+    # 縮短文字，避免介面被切掉
+    if obv_change_5d > 0: report['obv_trend'] = "📈 資金流入"
+    elif obv_change_5d < 0: report['obv_trend'] = "📉 資金流出"
 
     # 邏輯判斷
     if bias > 10:
         report['score'] += 15
-        report['details'].append(("[風險] 乖離率過大", "股價衝太快，像橡皮筋拉太緊，容易回檔。"))
+        report['details'].append(("[風險] 乖離率過大", "股價衝太快，容易回檔。"))
     elif bias < -10 and strategy_mode == "Cycle":
         report['score'] -= 10
-        report['details'].append(("[機會] 負乖離過大", "股價跌太深，容易出現反彈。"))
+        report['details'].append(("[機會] 負乖離過大", "股價跌太深，容易反彈。"))
 
     if price_change_5d >= 0 and obv_change_5d < 0:
         report['score'] += 20
-        report['details'].append(("[籌碼背離] 主力正在偷賣", "股價沒跌但大戶在跑，危險訊號。"))
+        report['details'].append(("[籌碼背離] 主力正在偷賣", "股價沒跌但大戶在跑。"))
     if price_change_5d <= 0 and obv_change_5d > 0:
         report['score'] -= 15
-        report['details'].append(("[籌碼背離] 主力正在偷買", "股價在跌但大戶在撿，底部訊號。"))
+        report['details'].append(("[籌碼背離] 主力正在偷買", "股價在跌但大戶在撿。"))
 
     if strategy_mode == "Trend":
         if current_close < ma20:
@@ -146,28 +146,28 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
             report['details'].append(("[危險] 跌破季線", "中期趨勢轉空。"))
         if current_close < report['atr_stop_price']:
             report['score'] += 40
-            report['details'].append(("[賣出訊號] 跌破 ATR 安全線", "跌破主力防守價，請離場。"))
+            report['details'].append(("[賣出訊號] 跌破 ATR 安全線", "跌破主力防守價。"))
         if rsi > 80 or mfi > 80:
             report['score'] += 10
             report['details'].append(("[風險] 指標過熱", "市場太嗨，容易回檔。"))
 
     elif strategy_mode == "Cycle":
-        report['action'] = "觀察循環位階"
+        report['action'] = "觀察位階"
         if pb_ratio:
             if pb_ratio < 1.0:
                 report['score'] = 10
-                report['action'] = "建議分批佈局 (價值區)"
-                report['details'].append(("[機會] P/B < 1.0", "股價低於淨值，歷史底部。"))
+                report['action'] = "建議分批佈局"
+                report['details'].append(("[機會] P/B < 1.0", "股價低於淨值，便宜。"))
             elif pb_ratio < 1.5:
                 report['score'] = 40
                 report['action'] = "續抱 / 觀望"
                 report['details'].append(("[中性] P/B 正常", "價格合理。"))
             else:
                 report['score'] = 70
-                report['details'].append(("[注意] P/B 過高", "循環股價格偏貴。"))
+                report['details'].append(("[注意] P/B 過高", "價格偏貴。"))
         if k_val < 20:
             report['score'] -= 10
-            report['details'].append(("[訊號] KD低檔鈍化", "嚴重超賣，隨時可能反彈。"))
+            report['details'].append(("[訊號] KD低檔鈍化", "嚴重超賣。"))
 
     user_stop_price = buy_price * (1 - stop_loss_pct / 100)
     if current_close <= user_stop_price:
@@ -186,10 +186,10 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report
 
 # ---------------------------------------------------------
-# 3. 頁面 A: 股票分析儀表板 (Main Dashboard)
+# 3. 頁面 A: 儀表板
 # ---------------------------------------------------------
 def dashboard_page():
-    st.title("🛡️ 股票決策輔助系統 (Ultimate)")
+    st.title("🛡️ 股票決策輔助系統")
     st.caption("請在左側輸入資料，系統將自動運算風險與建議。")
     st.divider()
 
@@ -227,23 +227,23 @@ def dashboard_page():
     c1, c2, c3 = st.columns(3)
     c1.metric("當前股價", f"{current_price:.2f}")
     c2.metric("總損益", f"{int(pl_amount):,} 元", f"{pl_pct:.2f}%")
-    c3.metric("風險評分", f"{report['score']} / 100")
+    c3.metric("風險評分", f"{report['score']} / 100", help="分數越高越危險")
 
     st.markdown("---")
     
-    # 指標
+    # 指標 (修正版：文字縮短，避免切到)
     st.subheader("📊 關鍵指標體檢")
     k1, k2, k3, k4 = st.columns(4)
     
     bias_val = df['Bias'].iloc[-1]
-    k1.metric("乖離率", f"{bias_val:.1f}%")
+    k1.metric("乖離率", f"{bias_val:.1f}%", help="正數代表漲離均線太遠，負數代表跌深。")
     
     div_yield = info.get('dividendYield', 0)
-    div_display = f"{div_yield*100:.2f}%" if div_yield else "無"
-    k2.metric("現金殖利率", div_display)
+    div_display = f"{div_yield*100:.2f}%" if div_yield else "N/A"
+    k2.metric("殖利率", div_display, help="現金殖利率，N/A 代表無資料。")
     
-    k3.metric("OBV 動向", report['obv_trend'])
-    k4.metric("ATR 安全線", f"{report['atr_stop_price']:.2f}")
+    k3.metric("OBV 動向", report['obv_trend'], help="趨勢向上代表主力在買。")
+    k4.metric("ATR 止損價", f"{report['atr_stop_price']:.1f}", help="跌破此價格建議賣出。")
 
     with st.container():
         st.write("🔎 **進階查詢**")
@@ -304,65 +304,83 @@ def dashboard_page():
         st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 頁面 B: 媽媽專用說明書 (Instruction Manual)
+# 4. 頁面 B: 說明書 (修復 HTML 顯示問題)
 # ---------------------------------------------------------
 def instruction_page():
     st.title("📖 媽媽的股票操作說明書")
     st.markdown("### 歡迎使用！請把這裡當作您的「投資字典」。")
-    st.info("💡 提示：下方有底線的藍色文字，滑鼠移上去(不要點) 稍微停一下，就會出現解釋喔！")
-    
+    st.info("💡 提示：下方有藍色底線的文字，滑鼠移上去稍微停一下，就會出現解釋喔！")
     st.divider()
     
-    st.header("1. 系統是做什麼的？")
-    st.markdown(f"""
-    這套系統就像是您開車時的 **{tooltip('安全氣囊', '當發生意外時，保護您不要受重傷')}** 與 **{tooltip('倒車雷達', '偵測後方有無障礙物，預防撞擊')}**。
+    # 使用 HTML 區塊來確保 Tooltip 正常運作
+    st.markdown("""
+    <h3>1. 系統是做什麼的？</h3>
+    <p>這套系統就像是您開車時的 
+    <span class='tooltip-text' title='當發生意外時，保護您不要受重傷'>安全氣囊</span> 
+    與 
+    <span class='tooltip-text' title='偵測後方有無障礙物，預防撞擊'>倒車雷達</span>。</p>
+    <ul>
+        <li>它<b>不能</b>保證您買在最低點。</li>
+        <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護您的退休金。</li>
+    </ul>
+    <hr>
     
-    * 它**不能**保證您買在最低點。
-    * 它**可以**保證當危險發生時，第一時間叫您跑，保護您的退休金。
-    """)
+    <h3>2. 名詞解釋 (滑鼠移到藍字上看解釋)</h3>
     
-    st.header("2. 名詞解釋 (滑鼠移到藍字上看解釋)")
+    <h4>💰 判斷貴不貴</h4>
+    <ul>
+        <li>
+            <span class='tooltip-text' title='就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。'>P/B (股價淨值比)</span>：
+            如果是景氣循環股 (如南亞科、長榮)，看到 P/B < 1.0 代表很便宜，可以買。
+        </li>
+        <li>
+            <span class='tooltip-text' title='假設股價都不漲，光靠公司發的利息，每年可以拿多少 %。就像銀行定存利息。'>現金殖利率</span>：
+            如果有 5% 以上，就算被套牢也比較安心。
+        </li>
+    </ul>
     
-    st.subheader("💰 判斷貴不貴")
-    st.markdown(f"""
-    * **{tooltip('P/B (股價淨值比)', '就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。')}**：
-        * 如果是 **{tooltip('景氣循環股', '例如航運、記憶體、鋼鐵。賺錢時大賺，賠錢時大賠的股票。')}** (如南亞科、長榮)，看到 P/B < 1.0 代表很便宜，可以買。
-    * **{tooltip('現金殖利率', '假設股價都不漲，光靠公司發的利息，每年可以拿多少 %。')}**：
-        * 就像銀行定存利息。如果有 5% 以上，就算被套牢也比較安心。
-    """)
+    <h4>🚀 判斷會不會漲</h4>
+    <ul>
+        <li>
+            <span class='tooltip-text' title='主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。'>OBV (能量潮)</span>：
+            這是最好的進場訊號，代表有人在吃貨。
+        </li>
+        <li>
+            <span class='tooltip-text' title='像溜狗的繩子。如果股價衝太快(乖離太大)，繩子會把狗拉回來，代表漲太多了，不要追高。'>乖離率</span>：
+            如果數值超過 10%，千萬不要買，很容易買在最高點。
+        </li>
+    </ul>
     
-    st.subheader("🚀 判斷會不會漲")
-    st.markdown(f"""
-    * **{tooltip('OBV (能量潮)', '主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。')}**：
-        * 這是最好的進場訊號，代表有人在吃貨。
-    * **{tooltip('乖離率', '像溜狗的繩子。如果股價衝太快(乖離太大)，繩子會把狗拉回來，代表漲太多了，不要追高。')}**：
-        * 如果數值超過 10%，千萬不要買，很容易買在最高點。
-    """)
+    <h4>🛡️ 判斷什麼時候跑</h4>
+    <ul>
+        <li>
+            <span class='tooltip-text' title='電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。'>ATR 安全線</span>：
+            不要心存僥倖，跌破就是賣。
+        </li>
+        <li>
+            <span class='tooltip-text' title='一種鎖住獲利的策略。當股價從最高點掉下來 10%，就強制獲利了結。'>移動停利</span>：
+            這是為了防止「賺 20 萬變賠錢」的慘劇。
+        </li>
+    </ul>
     
-    st.subheader("🛡️ 判斷什麼時候跑")
-    st.markdown(f"""
-    * **{tooltip('ATR 安全線', '電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。')}**：
-        * 不要心存僥倖，跌破就是賣。
-    * **{tooltip('移動停利', '一種鎖住獲利的策略。當股價從最高點掉下來 10%，就強制獲利了結。')}**：
-        * 這是為了防止「賺 20 萬變賠錢」的慘劇。開啟後，系統會幫您顧好錢包。
-    """)
+    <hr>
     
-    st.divider()
-    
-    st.header("3. 紅綠燈號怎麼看？")
+    <h3>3. 紅綠燈號怎麼看？</h3>
+    """, unsafe_allow_html=True)
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.error("🛑 紅色：危險")
-        st.markdown("主力在賣、跌破支撐。**請賣出或減碼**，不要加碼。")
+        st.markdown("主力在賣、跌破支撐。**請賣出或減碼**。")
     with c2:
         st.success("✅ 綠色：安全")
         st.markdown("價值浮現、主力在買。**可以分批買進**。")
     with c3:
         st.warning("⚠️ 橘色：觀望")
-        st.markdown("方向不明確。**多看少做**，不要亂動。")
+        st.markdown("方向不明確。**多看少做**。")
 
 # ---------------------------------------------------------
-# 5. 主程式 (導航控制)
+# 5. 主程式
 # ---------------------------------------------------------
 def main():
     st.sidebar.title("導覽選單")
