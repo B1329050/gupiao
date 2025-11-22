@@ -177,7 +177,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report
 
 # ---------------------------------------------------------
-# 3. 儀表板
+# 3. 儀表板頁面
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ 股票決策輔助系統")
@@ -207,10 +207,8 @@ def dashboard_page():
     strategy_mode = st.sidebar.radio("模式", ("Trend (趨勢)", "Cycle (循環)"), index=mode_index)
     st.sidebar.markdown("---")
     use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
-    
-    # ★★★ 新增：開發者驗證模式 ★★★
     st.sidebar.markdown("---")
-    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False, help="勾選後，下方會顯示原始數據，供您比對券商軟體使用。")
+    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
 
     report = analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing)
     
@@ -266,18 +264,11 @@ def dashboard_page():
         total_cost = buy_price * shares_held
         loss_years = abs(pl_amount) / (total_cost * deposit_rate) if total_cost > 0 else 0
         st.error(f"💸 **現實換算**：賠掉了 **{loss_years:.1f} 年** 的定存利息。")
-        
-    # ★★★ 驗證模式顯示區 ★★★
+    
     if debug_mode:
-        st.markdown("### 🔧 原始數據驗證 (Debug Mode)")
-        st.info("請打開您的券商 App，比對下方的「Close (收盤價)」與「MA20 (月線)」是否接近。")
-        
-        # 整理要顯示的數據
-        debug_df = df[['Close', 'MA20', 'MA60', 'RSI', 'OBV']].tail(5).copy()
-        # 格式化小數點
-        debug_df = debug_df.style.format("{:.2f}")
-        st.dataframe(debug_df)
-        st.caption("註：技術指標 (MA, RSI) 因計算公式起始點不同，與券商軟體可能有微小誤差，但趨勢應一致。")
+        st.markdown("### 🔧 原始數據驗證")
+        debug_df = df[['Close', 'MA20', 'MA60', 'RSI', 'OBV']].tail(5)
+        st.dataframe(debug_df.style.format("{:.2f}"))
 
     # 圖表
     st.markdown("### 📈 全方位分析圖")
@@ -311,7 +302,7 @@ def dashboard_page():
         st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 說明書
+# 4. 說明書頁面
 # ---------------------------------------------------------
 def instruction_page():
     st.title("📖 媽媽的股票操作說明書")
@@ -385,6 +376,9 @@ def instruction_page():
         st.warning("⚠️ 橘色：觀望")
         st.markdown("方向不明確。**多看少做**。")
 
+# ---------------------------------------------------------
+# 5. 主程式
+# ---------------------------------------------------------
 def main():
     st.sidebar.title("導覽選單")
     page = st.sidebar.radio("請選擇頁面", ["📊 股票分析儀表板", "📖 媽媽專用說明書"])
@@ -393,10 +387,6 @@ def main():
     if page == "📊 股票分析儀表板":
         dashboard_page()
     else:
-        instruction_page()
-
-if __name__ == "__main__":
-    main()
         instruction_page()
 
 if __name__ == "__main__":
