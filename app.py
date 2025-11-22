@@ -14,33 +14,36 @@ st.set_page_config(page_title="Stock Guardian Ultimate", layout="wide", page_ico
 
 st.markdown("""
     <style>
+    /* 風險訊號 */
     .status-danger { 
         color: #D32F2F; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFEBEE; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #D32F2F; margin-bottom: 10px;
     }
+    /* 安全訊號 */
     .status-safe { 
         color: #2E7D32; font-weight: bold; font-size: 1.2rem; 
         background-color: #E8F5E9; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #2E7D32; margin-bottom: 10px;
     }
+    /* 中性訊號 */
     .status-neutral { 
         color: #EF6C00; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFF3E0; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #EF6C00; margin-bottom: 10px;
     }
     .explanation-text { font-size: 1rem; color: #444; margin-left: 5px; line-height: 1.5; }
-    
     [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
     
     .tooltip-text {
-        color: #0066cc;
-        font-weight: bold;
-        text-decoration: underline dotted;
-        cursor: help;
+        color: #0066cc; font-weight: bold; text-decoration: underline dotted; cursor: help;
     }
     </style>
     """, unsafe_allow_html=True)
+
+# --- Tooltip ---
+def tooltip(text, desc):
+    return f'<abbr title="{desc}">{text}</abbr>'
 
 # ---------------------------------------------------------
 # 2. 資料獲取
@@ -49,16 +52,14 @@ st.markdown("""
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period="5y")
+        df = stock.history(period="2y") # 選股掃描不需要太長，2年夠了
         if df.empty: return None, None
         info = stock.info
 
-        # 基礎
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
         
-        # 進階
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=9, smooth_window=3)
         df['K'] = stoch.stoch()
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
@@ -71,12 +72,16 @@ def get_stock_data(ticker):
         return None, None
 
 def calculate_seasonality(df):
-    df_monthly = df.copy()
-    df_monthly['Month'] = df_monthly.index.month
-    df_monthly['Pct_Change'] = df_monthly['Close'].pct_change() * 100
-    seasonal_stats = df_monthly.groupby('Month')['Pct_Change'].mean()
-    win_rate = df_monthly[df_monthly['Pct_Change'] > 0].groupby('Month')['Pct_Change'].count() / df_monthly.groupby('Month')['Pct_Change'].count() * 100
-    return seasonal_stats, win_rate
+    # 為了掃描速度，選股模式下不計算季節性，只在單股分析時計算
+    try:
+        df_monthly = df.copy()
+        df_monthly['Month'] = df_monthly.index.month
+        df_monthly['Pct_Change'] = df_monthly['Close'].pct_change() * 100
+        seasonal_stats = df_monthly.groupby('Month')['Pct_Change'].mean()
+        win_rate = df_monthly[df_monthly['Pct_Change'] > 0].groupby('Month')['Pct_Change'].count() / df_monthly.groupby('Month')['Pct_Change'].count() * 100
+        return seasonal_stats, win_rate
+    except:
+        return None, None
 
 def detect_industry_type(info):
     sector = info.get('sector', '')
@@ -111,80 +116,80 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         "atr_stop_price": current_close - (2.0 * atr), "trailing_stop_price": 0.0, "obv_trend": "持平"
     }
     
-    if obv_change_5d > 0: report['obv_trend'] = "📈 資金流入"
-    elif obv_change_5d < 0: report['obv_trend'] = "📉 資金流出"
+    if obv_change_5d > 0: report['obv_trend'] = "📈 流入"
+    elif obv_change_5d < 0: report['obv_trend'] = "📉 流出"
 
     if bias > 10:
         report['score'] += 15
-        report['details'].append(("[風險] 乖離率過大", "股價衝太快，容易回檔。"))
+        report['details'].append(("[風險] 乖離率過大", "漲太兇，易回檔。"))
     elif bias < -10 and strategy_mode == "Cycle":
         report['score'] -= 10
-        report['details'].append(("[機會] 負乖離過大", "股價跌太深，容易反彈。"))
+        report['details'].append(("[機會] 負乖離過大", "跌太深，易反彈。"))
 
     if price_change_5d >= 0 and obv_change_5d < 0:
         report['score'] += 20
-        report['details'].append(("[籌碼背離] 主力正在偷賣", "股價沒跌但大戶在跑。"))
+        report['details'].append(("[籌碼背離] 主力偷賣", "股價沒跌但資金流出。"))
     if price_change_5d <= 0 and obv_change_5d > 0:
         report['score'] -= 15
-        report['details'].append(("[籌碼背離] 主力正在偷買", "股價在跌但大戶在撿。"))
+        report['details'].append(("[籌碼背離] 主力偷買", "股價跌但資金流入。"))
 
     if strategy_mode == "Trend":
         if current_close < ma20:
             report['score'] += 20
-            report['details'].append(("[警告] 跌破月線", "短期支撐破裂。"))
+            report['details'].append(("[警告] 跌破月線", "短線轉弱。"))
         if current_close < ma60:
             report['score'] += 30
-            report['details'].append(("[危險] 跌破季線", "中期趨勢轉空。"))
+            report['details'].append(("[危險] 跌破季線", "中線轉空。"))
         if current_close < report['atr_stop_price']:
             report['score'] += 40
-            report['details'].append(("[賣出訊號] 跌破 ATR 安全線", "跌破主力防守價。"))
+            report['details'].append(("[賣出] 跌破 ATR", "趨勢反轉。"))
         if rsi > 80 or mfi > 80:
             report['score'] += 10
-            report['details'].append(("[風險] 指標過熱", "市場太嗨，容易回檔。"))
+            report['details'].append(("[風險] 指標過熱", "市場太嗨。"))
 
     elif strategy_mode == "Cycle":
-        report['action'] = "觀察位階"
+        report['action'] = "觀察"
         if pb_ratio:
             if pb_ratio < 1.0:
                 report['score'] = 10
-                report['action'] = "建議分批佈局"
-                report['details'].append(("[機會] P/B < 1.0", "股價低於淨值，便宜。"))
+                report['action'] = "佈局 (便宜)"
+                report['details'].append(("[機會] P/B < 1.0", "價值浮現。"))
             elif pb_ratio < 1.5:
                 report['score'] = 40
-                report['action'] = "續抱 / 觀望"
-                report['details'].append(("[中性] P/B 正常", "價格合理。"))
+                report['action'] = "續抱/觀望"
             else:
                 report['score'] = 70
                 report['details'].append(("[注意] P/B 過高", "價格偏貴。"))
         if k_val < 20:
             report['score'] -= 10
-            report['details'].append(("[訊號] KD低檔鈍化", "嚴重超賣。"))
+            report['details'].append(("[訊號] KD低檔", "嚴重超賣。"))
 
-    user_stop_price = buy_price * (1 - stop_loss_pct / 100)
-    if current_close <= user_stop_price:
-        report['score'] = 100
-        report['details'].append(("[強制停損] 觸及虧損極限", "請執行紀律。"))
-
-    if use_trailing:
-        recent_high = df['High'].tail(60).max()
-        if buy_price > recent_high: recent_high = buy_price
-        report['trailing_stop_price'] = recent_high * 0.90
-        if current_close < report['trailing_stop_price']:
+    # 選股模式下，假設買入價=現價，故不計算停損
+    if buy_price > 0:
+        user_stop_price = buy_price * (1 - stop_loss_pct / 100)
+        if current_close <= user_stop_price:
             report['score'] = 100
-            report['details'].append(("[停利訊號] 觸發移動停利", "回檔 10%，鎖住獲利。"))
+            report['details'].append(("[強制停損] 觸及虧損", "請執行紀律。"))
+
+        if use_trailing:
+            recent_high = df['High'].tail(60).max()
+            if buy_price > recent_high: recent_high = buy_price
+            report['trailing_stop_price'] = recent_high * 0.90
+            if current_close < report['trailing_stop_price']:
+                report['score'] = 100
+                report['details'].append(("[停利] 觸發移動停利", "回檔10%賣出。"))
 
     report['score'] = min(100, max(0, report['score']))
     return report
 
 # ---------------------------------------------------------
-# 3. 儀表板頁面
+# 3. 頁面 A: 儀表板
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ 股票決策輔助系統")
     st.caption("左側輸入資料，系統自動運算建議。")
     st.divider()
 
-    # 側邊欄
     st.sidebar.header("📊 輸入參數")
     ticker_input = st.sidebar.text_input("股票代號", "2408")
     ticker = f"{ticker_input}.TW" if not ticker_input.endswith(".TW") else ticker_input
@@ -216,7 +221,6 @@ def dashboard_page():
     pl_amount = (current_price - buy_price) * shares_held
     pl_pct = (pl_amount / (buy_price * shares_held)) * 100 if buy_price > 0 else 0
     
-    # 看板
     c1, c2, c3 = st.columns(3)
     c1.metric("當前股價", f"{current_price:.2f}")
     c2.metric("總損益", f"{int(pl_amount):,} 元", f"{pl_pct:.2f}%")
@@ -224,17 +228,14 @@ def dashboard_page():
 
     st.markdown("---")
     
-    # 指標
     st.subheader("📊 關鍵指標體檢")
     k1, k2, k3, k4 = st.columns(4)
     
     bias_val = df['Bias'].iloc[-1]
     k1.metric("乖離率", f"{bias_val:.1f}%", help="正數代表漲離均線太遠，負數代表跌深。")
-    
     div_yield = info.get('dividendYield', 0)
     div_display = f"{div_yield*100:.2f}%" if div_yield else "N/A"
     k2.metric("殖利率", div_display, help="現金殖利率，N/A 代表無資料。")
-    
     k3.metric("OBV 動向", report['obv_trend'], help="趨勢向上代表主力在買。")
     k4.metric("ATR 止損價", f"{report['atr_stop_price']:.1f}", help="跌破此價格建議賣出。")
 
@@ -245,7 +246,6 @@ def dashboard_page():
 
     st.markdown("---")
 
-    # 報告
     st.subheader("📋 AI 分析報告")
     if report['score'] >= 80: st.markdown(f"<div class='status-danger'>🛑 危險 (賣出/減碼)</div>", unsafe_allow_html=True)
     elif report['score'] <= 30: st.markdown(f"<div class='status-safe'>✅ 安全 ({report['action']})</div>", unsafe_allow_html=True)
@@ -270,7 +270,6 @@ def dashboard_page():
         debug_df = df[['Close', 'MA20', 'MA60', 'RSI', 'OBV']].tail(5)
         st.dataframe(debug_df.style.format("{:.2f}"))
 
-    # 圖表
     st.markdown("### 📈 全方位分析圖")
     tab1, tab2, tab3 = st.tabs(["價量走勢", "OBV 能量", "📅 月份慣性"])
     
@@ -293,20 +292,99 @@ def dashboard_page():
         st.plotly_chart(fig_obv, use_container_width=True)
         
     with tab3:
-        season_stats, win_rate = calculate_seasonality(df)
-        fig_season = go.Figure()
-        colors = ['#EF5350' if x > 0 else '#26A69A' for x in season_stats.values]
-        fig_season.add_trace(go.Bar(x=season_stats.index, y=season_stats.values, marker_color=colors, name='平均漲跌幅'))
-        fig_season.add_trace(go.Scatter(x=win_rate.index, y=win_rate.values, name='上漲機率', yaxis='y2', line=dict(color='blue', width=2, dash='dot')))
-        fig_season.update_layout(xaxis=dict(title="月份", tickmode='linear', tick0=1, dtick=1), yaxis2=dict(title="勝率 %", overlaying='y', side='right', range=[0, 100]), height=500, legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig_season, use_container_width=True)
+        seasonal_data = calculate_seasonality(df)
+        if seasonal_data:
+            season_stats, win_rate = seasonal_data
+            fig_season = go.Figure()
+            colors = ['#EF5350' if x > 0 else '#26A69A' for x in season_stats.values]
+            fig_season.add_trace(go.Bar(x=season_stats.index, y=season_stats.values, marker_color=colors, name='平均漲跌幅'))
+            fig_season.add_trace(go.Scatter(x=win_rate.index, y=win_rate.values, name='上漲機率', yaxis='y2', line=dict(color='blue', width=2, dash='dot')))
+            fig_season.update_layout(xaxis=dict(title="月份", tickmode='linear', tick0=1, dtick=1), yaxis2=dict(title="勝率 %", overlaying='y', side='right', range=[0, 100]), height=500, legend=dict(orientation="h", y=1.1))
+            st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 說明書頁面
+# 4. 頁面 B: 智慧選股雷達 (Scanner Page)
+# ---------------------------------------------------------
+def scanner_page():
+    st.title("🎯 智慧選股雷達")
+    st.markdown("### AI 自動掃描熱門觀察名單")
+    st.info("💡 這是針對「熱門股」的快速健檢。我們會用同樣的 AI 邏輯去評分，幫您找出現在最安全、最值得留意的股票。")
+    
+    # 預設觀察名單 (可自行修改)
+    watchlist = {
+        "台積電": "2330.TW",
+        "鴻海": "2317.TW",
+        "聯發科": "2454.TW",
+        "廣達": "2382.TW",
+        "富邦金": "2881.TW",
+        "國泰金": "2882.TW",
+        "長榮": "2603.TW",
+        "南亞科": "2408.TW",
+        "中鋼": "2002.TW",
+        "台塑": "1301.TW"
+    }
+    
+    if st.button("🚀 開始掃描 (需約 30 秒)"):
+        progress_bar = st.progress(0)
+        results = []
+        
+        for i, (name, ticker) in enumerate(watchlist.items()):
+            df, info = get_stock_data(ticker)
+            if df is not None:
+                # 自動判斷模式
+                detected = detect_industry_type(info)
+                mode = "Cycle" if detected else "Trend"
+                
+                # 假設買入價=現價 (模擬進場)
+                current_price = df['Close'].iloc[-1]
+                
+                # 執行分析
+                report = analyze_logic(df, info, current_price, 10, mode, False)
+                
+                # 整理結果
+                status_icon = "⚪"
+                if report['score'] <= 30: status_icon = "🟢 安全"
+                elif report['score'] >= 80: status_icon = "🔴 危險"
+                else: status_icon = "🟠 觀望"
+                
+                results.append({
+                    "股票名稱": name,
+                    "代號": ticker.replace(".TW", ""),
+                    "現價": f"{current_price:.1f}",
+                    "AI 評分": report['score'],
+                    "狀態": status_icon,
+                    "建議": report['action'],
+                    "籌碼": report['obv_trend']
+                })
+            
+            progress_bar.progress((i + 1) / len(watchlist))
+            
+        # 顯示結果表格
+        st.success("掃描完成！")
+        res_df = pd.DataFrame(results)
+        # 依照分數排序 (分數越低越安全 -> 排前面)
+        res_df = res_df.sort_values(by="AI 評分")
+        
+        st.dataframe(
+            res_df,
+            column_config={
+                "AI 評分": st.column_config.NumberColumn(help="分數越低越安全"),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        st.markdown("""
+        **如何使用這個表格？**
+        * **找綠燈 (🟢)**：這些股票目前處於「低檔」或「安全區」，AI 認為適合分批佈局。
+        * **避開紅燈 (🔴)**：這些股票目前過熱或主力在賣，千萬不要追高。
+        """)
+
+# ---------------------------------------------------------
+# 5. 說明書頁面
 # ---------------------------------------------------------
 def instruction_page():
     st.title("📖 媽媽的股票操作說明書")
-    st.markdown("### 歡迎使用！請把這裡當作您的「投資字典」。")
     st.info("💡 提示：下方有藍色底線的文字，滑鼠移上去稍微停一下，就會出現解釋喔！")
     st.divider()
     
@@ -321,71 +399,26 @@ def instruction_page():
         <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護您的退休金。</li>
     </ul>
     <hr>
-    
-    <h3>2. 名詞解釋 (滑鼠移到藍字上看解釋)</h3>
-    
-    <h4>💰 判斷貴不貴</h4>
+    <h3>2. 名詞解釋</h3>
     <ul>
-        <li>
-            <span class='tooltip-text' title='就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。'>P/B (股價淨值比)</span>：
-            如果是景氣循環股 (如南亞科、長榮)，看到 P/B < 1.0 代表很便宜，可以買。
-        </li>
-        <li>
-            <span class='tooltip-text' title='假設股價都不漲，光靠公司發的利息，每年可以拿多少 %。就像銀行定存利息。'>現金殖利率</span>：
-            如果有 5% 以上，就算被套牢也比較安心。
-        </li>
+        <li><span class='tooltip-text' title='就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。'>P/B (股價淨值比)</span>：便宜 vs 貴。</li>
+        <li><span class='tooltip-text' title='主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。'>OBV (能量潮)</span>：主力有沒有在買。</li>
+        <li><span class='tooltip-text' title='電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。'>ATR 安全線</span>：最後防守點。</li>
     </ul>
-    
-    <h4>🚀 判斷會不會漲</h4>
-    <ul>
-        <li>
-            <span class='tooltip-text' title='主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。'>OBV (能量潮)</span>：
-            這是最好的進場訊號，代表有人在吃貨。
-        </li>
-        <li>
-            <span class='tooltip-text' title='像溜狗的繩子。如果股價衝太快(乖離太大)，繩子會把狗拉回來，代表漲太多了，不要追高。'>乖離率</span>：
-            如果數值超過 10%，千萬不要買，很容易買在最高點。
-        </li>
-    </ul>
-    
-    <h4>🛡️ 判斷什麼時候跑</h4>
-    <ul>
-        <li>
-            <span class='tooltip-text' title='電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。'>ATR 安全線</span>：
-            不要心存僥倖，跌破就是賣。
-        </li>
-        <li>
-            <span class='tooltip-text' title='一種鎖住獲利的策略。當股價從最高點掉下來 10%，就強制獲利了結。'>移動停利</span>：
-            這是為了防止「賺 20 萬變賠錢」的慘劇。
-        </li>
-    </ul>
-    
-    <hr>
-    
-    <h3>3. 紅綠燈號怎麼看？</h3>
     """, unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.error("🛑 紅色：危險")
-        st.markdown("主力在賣、跌破支撐。**請賣出或減碼**。")
-    with c2:
-        st.success("✅ 綠色：安全")
-        st.markdown("價值浮現、主力在買。**可以分批買進**。")
-    with c3:
-        st.warning("⚠️ 橘色：觀望")
-        st.markdown("方向不明確。**多看少做**。")
-
 # ---------------------------------------------------------
-# 5. 主程式
+# 6. 主程式
 # ---------------------------------------------------------
 def main():
     st.sidebar.title("導覽選單")
-    page = st.sidebar.radio("請選擇頁面", ["📊 股票分析儀表板", "📖 媽媽專用說明書"])
+    page = st.sidebar.radio("請選擇功能", ["📊 股票分析儀表板", "🎯 智慧選股雷達", "📖 媽媽專用說明書"])
     st.sidebar.divider()
     
     if page == "📊 股票分析儀表板":
         dashboard_page()
+    elif page == "🎯 智慧選股雷達":
+        scanner_page()
     else:
         instruction_page()
 
