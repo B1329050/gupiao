@@ -107,8 +107,6 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     rsi = df['RSI'].iloc[-1]
     mfi = df['MFI'].iloc[-1]
     bias = df['Bias'].iloc[-1]
-    
-    # ★★★ 修復重點：補上 k_val 定義 ★★★
     k_val = df['K'].iloc[-1] 
     
     pb_ratio = info.get('priceToBook', None)
@@ -367,7 +365,6 @@ def instruction_page():
 # 5. 主程式 (導航控制)
 # ---------------------------------------------------------
 def main():
-    # 側邊欄導航
     st.sidebar.title("導覽選單")
     page = st.sidebar.radio("請選擇頁面", ["📊 股票分析儀表板", "📖 媽媽專用說明書"])
     st.sidebar.divider()
@@ -375,10 +372,6 @@ def main():
     if page == "📊 股票分析儀表板":
         dashboard_page()
     else:
-        instruction_page()
-
-if __name__ == "__main__":
-    main()
         instruction_page()
 
 if __name__ == "__main__":
