@@ -8,25 +8,22 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. 系統設定與 CSS
+# 1. 系統設定
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Guardian Ultimate", layout="wide", page_icon="🛡️")
 
 st.markdown("""
     <style>
-    /* 風險訊號 */
     .status-danger { 
         color: #D32F2F; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFEBEE; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #D32F2F; margin-bottom: 10px;
     }
-    /* 安全訊號 */
     .status-safe { 
         color: #2E7D32; font-weight: bold; font-size: 1.2rem; 
         background-color: #E8F5E9; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #2E7D32; margin-bottom: 10px;
     }
-    /* 中性訊號 */
     .status-neutral { 
         color: #EF6C00; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFF3E0; padding: 15px; border-radius: 8px; 
@@ -34,7 +31,6 @@ st.markdown("""
     }
     .explanation-text { font-size: 1rem; color: #444; margin-left: 5px; line-height: 1.5; }
     [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
-    
     .tooltip-text {
         color: #0066cc; font-weight: bold; text-decoration: underline dotted; cursor: help;
     }
@@ -52,7 +48,7 @@ def tooltip(text, desc):
 def get_stock_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        df = stock.history(period="2y") # 選股掃描不需要太長，2年夠了
+        df = stock.history(period="5y")
         if df.empty: return None, None
         info = stock.info
 
@@ -72,7 +68,6 @@ def get_stock_data(ticker):
         return None, None
 
 def calculate_seasonality(df):
-    # 為了掃描速度，選股模式下不計算季節性，只在單股分析時計算
     try:
         df_monthly = df.copy()
         df_monthly['Month'] = df_monthly.index.month
@@ -87,6 +82,12 @@ def detect_industry_type(info):
     sector = info.get('sector', '')
     industry = info.get('industry', '')
     summary = info.get('longBusinessSummary', '')
+    
+    # ETF 判斷 (如果沒有 sector 但有名稱)
+    short_name = info.get('shortName', '')
+    if 'ETF' in short_name or 'Dividend' in short_name:
+        return 'ETF'
+
     cycle_keywords = ['Semiconductors', 'Memory', 'DRAM', 'Flash', 'Marine', 'Shipping', 'Freight', 'Transport', 'Steel', 'Iron', 'Metal', 'Chemical', 'Oil', 'Panel', 'Display', 'LCD']
     
     primary_check = (str(sector) + " " + str(industry)).lower()
@@ -121,25 +122,25 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
 
     if bias > 10:
         report['score'] += 15
-        report['details'].append(("[風險] 乖離率過大", "漲太兇，易回檔。"))
+        report['details'].append(("[風險] 乖離率過大", "股價衝太快，容易回檔。"))
     elif bias < -10 and strategy_mode == "Cycle":
         report['score'] -= 10
-        report['details'].append(("[機會] 負乖離過大", "跌太深，易反彈。"))
+        report['details'].append(("[機會] 負乖離過大", "股價跌太深，容易反彈。"))
 
     if price_change_5d >= 0 and obv_change_5d < 0:
         report['score'] += 20
-        report['details'].append(("[籌碼背離] 主力偷賣", "股價沒跌但資金流出。"))
+        report['details'].append(("[籌碼背離] 主力正在偷賣", "股價沒跌但大戶在跑。"))
     if price_change_5d <= 0 and obv_change_5d > 0:
         report['score'] -= 15
-        report['details'].append(("[籌碼背離] 主力偷買", "股價跌但資金流入。"))
+        report['details'].append(("[籌碼背離] 主力正在偷買", "股價在跌但大戶在撿。"))
 
     if strategy_mode == "Trend":
         if current_close < ma20:
             report['score'] += 20
-            report['details'].append(("[警告] 跌破月線", "短線轉弱。"))
+            report['details'].append(("[警告] 跌破月線", "短期支撐破裂。"))
         if current_close < ma60:
             report['score'] += 30
-            report['details'].append(("[危險] 跌破季線", "中線轉空。"))
+            report['details'].append(("[危險] 跌破季線", "中期趨勢轉空。"))
         if current_close < report['atr_stop_price']:
             report['score'] += 40
             report['details'].append(("[賣出] 跌破 ATR", "趨勢反轉。"))
@@ -164,7 +165,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
             report['score'] -= 10
             report['details'].append(("[訊號] KD低檔", "嚴重超賣。"))
 
-    # 選股模式下，假設買入價=現價，故不計算停損
+    # 選股模式下，假設買入價=現價
     if buy_price > 0:
         user_stop_price = buy_price * (1 - stop_loss_pct / 100)
         if current_close <= user_stop_price:
@@ -183,7 +184,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report
 
 # ---------------------------------------------------------
-# 3. 頁面 A: 儀表板
+# 3. 儀表板頁面
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ 股票決策輔助系統")
@@ -303,82 +304,91 @@ def dashboard_page():
             st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 頁面 B: 智慧選股雷達 (Scanner Page)
+# 4. 頁面 B: 智慧選股雷達
 # ---------------------------------------------------------
 def scanner_page():
-    st.title("🎯 智慧選股雷達")
-    st.markdown("### AI 自動掃描熱門觀察名單")
-    st.info("💡 這是針對「熱門股」的快速健檢。我們會用同樣的 AI 邏輯去評分，幫您找出現在最安全、最值得留意的股票。")
+    st.title("🎯 智慧選股雷達 (擴充版)")
+    st.markdown("### AI 自動掃描 30 檔熱門股")
+    st.info("💡 掃描時間約需 40~60 秒，請耐心等候。綠色越多代表市場越好，紅色越多代表市場在休息。")
     
-    # 預設觀察名單 (可自行修改)
-    watchlist = {
-        "台積電": "2330.TW",
-        "鴻海": "2317.TW",
-        "聯發科": "2454.TW",
-        "廣達": "2382.TW",
-        "富邦金": "2881.TW",
-        "國泰金": "2882.TW",
-        "長榮": "2603.TW",
-        "南亞科": "2408.TW",
-        "中鋼": "2002.TW",
-        "台塑": "1301.TW"
+    # 分類觀察名單
+    watchlist_groups = {
+        "🤖 AI 半導體": {
+            "台積電": "2330.TW", "聯發科": "2454.TW", "鴻海": "2317.TW", "廣達": "2382.TW", 
+            "緯創": "3231.TW", "聯電": "2303.TW", "日月光": "3711.TW"
+        },
+        "💰 金融股": {
+            "富邦金": "2881.TW", "國泰金": "2882.TW", "中信金": "2891.TW", "兆豐金": "2886.TW", 
+            "玉山金": "2884.TW", "元大金": "2885.TW"
+        },
+        "🚢 傳產循環": {
+            "長榮": "2603.TW", "陽明": "2609.TW", "萬海": "2615.TW", 
+            "中鋼": "2002.TW", "台塑": "1301.TW", "南亞": "1303.TW", "南亞科": "2408.TW"
+        },
+        "📦 熱門 ETF": {
+            "0050 元大台灣50": "0050.TW", "0056 元大高股息": "0056.TW", "00878 國泰永續": "00878.TW",
+            "00929 復華科技": "00929.TW", "00919 群益精選": "00919.TW", "006208 富邦台50": "006208.TW"
+        }
     }
     
-    if st.button("🚀 開始掃描 (需約 30 秒)"):
+    if st.button("🚀 開始掃描"):
+        # 扁平化清單以便跑迴圈
+        full_list = []
+        for category, items in watchlist_groups.items():
+            for name, ticker in items.items():
+                full_list.append((category, name, ticker))
+        
         progress_bar = st.progress(0)
         results = []
         
-        for i, (name, ticker) in enumerate(watchlist.items()):
-            df, info = get_stock_data(ticker)
-            if df is not None:
-                # 自動判斷模式
-                detected = detect_industry_type(info)
-                mode = "Cycle" if detected else "Trend"
-                
-                # 假設買入價=現價 (模擬進場)
-                current_price = df['Close'].iloc[-1]
-                
-                # 執行分析
-                report = analyze_logic(df, info, current_price, 10, mode, False)
-                
-                # 整理結果
-                status_icon = "⚪"
-                if report['score'] <= 30: status_icon = "🟢 安全"
-                elif report['score'] >= 80: status_icon = "🔴 危險"
-                else: status_icon = "🟠 觀望"
-                
-                results.append({
-                    "股票名稱": name,
-                    "代號": ticker.replace(".TW", ""),
-                    "現價": f"{current_price:.1f}",
-                    "AI 評分": report['score'],
-                    "狀態": status_icon,
-                    "建議": report['action'],
-                    "籌碼": report['obv_trend']
-                })
+        for i, (category, name, ticker) in enumerate(full_list):
+            try:
+                df, info = get_stock_data(ticker)
+                if df is not None:
+                    detected = detect_industry_type(info)
+                    mode = "Cycle" if detected or "ETF" in category else "Trend"
+                    
+                    # ETF 強制設為 Trend 或 Cycle 依屬性，這裡簡化邏輯
+                    if "ETF" in category: mode = "Trend" 
+                    
+                    current_price = df['Close'].iloc[-1]
+                    report = analyze_logic(df, info, current_price, 10, mode, False)
+                    
+                    status_icon = "⚪"
+                    if report['score'] <= 30: status_icon = "🟢 安全"
+                    elif report['score'] >= 80: status_icon = "🔴 危險"
+                    else: status_icon = "🟠 觀望"
+                    
+                    results.append({
+                        "分類": category,
+                        "股票": name,
+                        "現價": f"{current_price:.1f}",
+                        "分數": report['score'],
+                        "狀態": status_icon,
+                        "建議": report['action'],
+                        "籌碼": report['obv_trend']
+                    })
+            except:
+                pass # 跳過錯誤的股票
             
-            progress_bar.progress((i + 1) / len(watchlist))
+            progress_bar.progress((i + 1) / len(full_list))
             
-        # 顯示結果表格
         st.success("掃描完成！")
-        res_df = pd.DataFrame(results)
-        # 依照分數排序 (分數越低越安全 -> 排前面)
-        res_df = res_df.sort_values(by="AI 評分")
         
-        st.dataframe(
-            res_df,
-            column_config={
-                "AI 評分": st.column_config.NumberColumn(help="分數越低越安全"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-        
-        st.markdown("""
-        **如何使用這個表格？**
-        * **找綠燈 (🟢)**：這些股票目前處於「低檔」或「安全區」，AI 認為適合分批佈局。
-        * **避開紅燈 (🔴)**：這些股票目前過熱或主力在賣，千萬不要追高。
-        """)
+        if results:
+            res_df = pd.DataFrame(results)
+            res_df = res_df.sort_values(by="分數") # 分數低 (安全) 的排前面
+            
+            st.dataframe(
+                res_df,
+                column_config={
+                    "分數": st.column_config.NumberColumn(help="越低越好"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.warning("無法獲取資料，請稍後再試。")
 
 # ---------------------------------------------------------
 # 5. 說明書頁面
