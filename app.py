@@ -65,7 +65,8 @@ def get_stock_data(ticker):
         
         # 進階指標
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=9, smooth_window=3)
-        df['K'] = stoch.stoch()
+        df['K'] = stoch.stoch() # KD指標中的K值
+        
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
@@ -98,6 +99,7 @@ def detect_industry_type(info):
     return None
 
 def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailing):
+    # 取得最新數據
     current_close = df['Close'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
     ma60 = df['MA60'].iloc[-1]
@@ -105,6 +107,10 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     rsi = df['RSI'].iloc[-1]
     mfi = df['MFI'].iloc[-1]
     bias = df['Bias'].iloc[-1]
+    
+    # ★★★ 修復重點：補上 k_val 定義 ★★★
+    k_val = df['K'].iloc[-1] 
+    
     pb_ratio = info.get('priceToBook', None)
     
     price_change_5d = current_close - df['Close'].iloc[-5]
@@ -369,6 +375,10 @@ def main():
     if page == "📊 股票分析儀表板":
         dashboard_page()
     else:
+        instruction_page()
+
+if __name__ == "__main__":
+    main()
         instruction_page()
 
 if __name__ == "__main__":
