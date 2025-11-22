@@ -8,25 +8,22 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. 系統設定與 CSS (修復排版與字體大小)
+# 1. 系統設定與 CSS
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Guardian Ultimate", layout="wide", page_icon="🛡️")
 
 st.markdown("""
     <style>
-    /* 風險訊號 */
     .status-danger { 
         color: #D32F2F; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFEBEE; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #D32F2F; margin-bottom: 10px;
     }
-    /* 安全訊號 */
     .status-safe { 
         color: #2E7D32; font-weight: bold; font-size: 1.2rem; 
         background-color: #E8F5E9; padding: 15px; border-radius: 8px; 
         border-left: 6px solid #2E7D32; margin-bottom: 10px;
     }
-    /* 中性訊號 */
     .status-neutral { 
         color: #EF6C00; font-weight: bold; font-size: 1.2rem; 
         background-color: #FFF3E0; padding: 15px; border-radius: 8px; 
@@ -34,12 +31,8 @@ st.markdown("""
     }
     .explanation-text { font-size: 1rem; color: #444; margin-left: 5px; line-height: 1.5; }
     
-    /* 強制調整 Metric 字體大小，避免被切掉 */
-    [data-testid="stMetricValue"] {
-        font-size: 1.4rem !important;
-    }
+    [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
     
-    /* 說明書的藍色解釋文字 */
     .tooltip-text {
         color: #0066cc;
         font-weight: bold;
@@ -118,11 +111,9 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         "atr_stop_price": current_close - (2.0 * atr), "trailing_stop_price": 0.0, "obv_trend": "持平"
     }
     
-    # 縮短文字，避免介面被切掉
     if obv_change_5d > 0: report['obv_trend'] = "📈 資金流入"
     elif obv_change_5d < 0: report['obv_trend'] = "📉 資金流出"
 
-    # 邏輯判斷
     if bias > 10:
         report['score'] += 15
         report['details'].append(("[風險] 乖離率過大", "股價衝太快，容易回檔。"))
@@ -186,11 +177,11 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report
 
 # ---------------------------------------------------------
-# 3. 頁面 A: 儀表板
+# 3. 儀表板
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ 股票決策輔助系統")
-    st.caption("請在左側輸入資料，系統將自動運算風險與建議。")
+    st.caption("左側輸入資料，系統自動運算建議。")
     st.divider()
 
     # 側邊欄
@@ -216,6 +207,10 @@ def dashboard_page():
     strategy_mode = st.sidebar.radio("模式", ("Trend (趨勢)", "Cycle (循環)"), index=mode_index)
     st.sidebar.markdown("---")
     use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
+    
+    # ★★★ 新增：開發者驗證模式 ★★★
+    st.sidebar.markdown("---")
+    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False, help="勾選後，下方會顯示原始數據，供您比對券商軟體使用。")
 
     report = analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing)
     
@@ -231,7 +226,7 @@ def dashboard_page():
 
     st.markdown("---")
     
-    # 指標 (修正版：文字縮短，避免切到)
+    # 指標
     st.subheader("📊 關鍵指標體檢")
     k1, k2, k3, k4 = st.columns(4)
     
@@ -271,6 +266,18 @@ def dashboard_page():
         total_cost = buy_price * shares_held
         loss_years = abs(pl_amount) / (total_cost * deposit_rate) if total_cost > 0 else 0
         st.error(f"💸 **現實換算**：賠掉了 **{loss_years:.1f} 年** 的定存利息。")
+        
+    # ★★★ 驗證模式顯示區 ★★★
+    if debug_mode:
+        st.markdown("### 🔧 原始數據驗證 (Debug Mode)")
+        st.info("請打開您的券商 App，比對下方的「Close (收盤價)」與「MA20 (月線)」是否接近。")
+        
+        # 整理要顯示的數據
+        debug_df = df[['Close', 'MA20', 'MA60', 'RSI', 'OBV']].tail(5).copy()
+        # 格式化小數點
+        debug_df = debug_df.style.format("{:.2f}")
+        st.dataframe(debug_df)
+        st.caption("註：技術指標 (MA, RSI) 因計算公式起始點不同，與券商軟體可能有微小誤差，但趨勢應一致。")
 
     # 圖表
     st.markdown("### 📈 全方位分析圖")
@@ -304,7 +311,7 @@ def dashboard_page():
         st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 4. 頁面 B: 說明書 (修復 HTML 顯示問題)
+# 4. 說明書
 # ---------------------------------------------------------
 def instruction_page():
     st.title("📖 媽媽的股票操作說明書")
@@ -312,7 +319,6 @@ def instruction_page():
     st.info("💡 提示：下方有藍色底線的文字，滑鼠移上去稍微停一下，就會出現解釋喔！")
     st.divider()
     
-    # 使用 HTML 區塊來確保 Tooltip 正常運作
     st.markdown("""
     <h3>1. 系統是做什麼的？</h3>
     <p>這套系統就像是您開車時的 
@@ -379,9 +385,6 @@ def instruction_page():
         st.warning("⚠️ 橘色：觀望")
         st.markdown("方向不明確。**多看少做**。")
 
-# ---------------------------------------------------------
-# 5. 主程式
-# ---------------------------------------------------------
 def main():
     st.sidebar.title("導覽選單")
     page = st.sidebar.radio("請選擇頁面", ["📊 股票分析儀表板", "📖 媽媽專用說明書"])
@@ -390,6 +393,10 @@ def main():
     if page == "📊 股票分析儀表板":
         dashboard_page()
     else:
+        instruction_page()
+
+if __name__ == "__main__":
+    main()
         instruction_page()
 
 if __name__ == "__main__":
