@@ -218,7 +218,7 @@ def dashboard_page():
     st.sidebar.markdown("---")
     use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
     st.sidebar.markdown("---")
-    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
+    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式(驗證數據有沒有抓錯)", value=False)
 
     report = analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing)
     
@@ -414,7 +414,7 @@ def instruction_page():
     <span class='tooltip-text' title='偵測後方有無障礙物，預防撞擊'>倒車雷達</span>。</p>
     <ul>
         <li>它<b>不能</b>保證您買在最低點。</li>
-        <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護您的退休金。</li>
+        <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護辛苦賺的錢。</li>
     </ul>
     <hr>
     <h3>2. 名詞解釋</h3>
