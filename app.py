@@ -1,12 +1,3 @@
-"""
-Stock Guardian Pro (Ver 5.1 - Math Edge & Forward Testing Edition)
-Author: Stock Guardian AI
-Description: 
-    一個專為實戰設計的台股決策儀表板。
-    不依賴回測，而是使用數學優勢 (VWAP, Slope, R/R Ratio, Volatility Sizing) 
-    來輔助當下的交易決策。
-"""
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -14,7 +5,7 @@ import numpy as np
 import ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 import time
 
 # ---------------------------------------------------------
@@ -24,414 +15,460 @@ st.set_page_config(page_title="Stock Guardian Pro", layout="wide", page_icon="�
 
 st.markdown("""
     <style>
-    .status-danger { 
-        color: #D32F2F; font-weight: bold; font-size: 1.2rem; 
-        background-color: #FFEBEE; padding: 15px; border-radius: 8px; 
-        border-left: 6px solid #D32F2F; margin-bottom: 10px;
+    /* 狀態通知框 */
+    .status-box { 
+        padding: 15px; 
+        border-radius: 10px; 
+        margin-bottom: 15px; 
+        border-left: 6px solid #ccc; 
+        background-color: #f9f9f9;
     }
-    .status-safe { 
-        color: #2E7D32; font-weight: bold; font-size: 1.2rem; 
-        background-color: #E8F5E9; padding: 15px; border-radius: 8px; 
-        border-left: 6px solid #2E7D32; margin-bottom: 10px;
-    }
-    .status-neutral { 
-        color: #EF6C00; font-weight: bold; font-size: 1.2rem; 
-        background-color: #FFF3E0; padding: 15px; border-radius: 8px; 
-        border-left: 6px solid #EF6C00; margin-bottom: 10px;
-    }
-    .explanation-text { font-size: 1rem; color: #444; margin-left: 5px; line-height: 1.5; }
+    .danger { background-color: #FFEBEE; border-color: #D32F2F; color: #C62828; }
+    .safe { background-color: #E8F5E9; border-color: #2E7D32; color: #1B5E20; }
+    .neutral { background-color: #FFF3E0; border-color: #EF6C00; color: #E65100; }
+    .market-bear { background-color: #212121; border-color: #FF5252; color: #FF5252; } 
+    
     [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
-    .tooltip-text {
-        color: #0066cc; font-weight: bold; text-decoration: underline dotted; cursor: help;
-    }
+    .explanation-text { font-size: 1rem; color: #555; margin-left: 5px; line-height: 1.5; }
+    .tooltip-text { color: #0066cc; font-weight: bold; text-decoration: underline dotted; cursor: help; }
     </style>
     """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 2. 資料獲取 (核心數學運算層)
+# 2. 資料獲取層
 # ---------------------------------------------------------
-@st.cache_data(ttl=900) 
-def get_stock_data(ticker_input):
+
+@st.cache_data(ttl=1800)
+def get_macro_data():
+    """抓取大盤與恐慌指數"""
+    try:
+        twii = yf.Ticker("^TWII")
+        hist_tw = twii.history(period="6mo")
+        
+        if hist_tw.empty:
+            market_status = "Unknown"
+        else:
+            tw_close = hist_tw['Close'].iloc[-1]
+            tw_ma20 = hist_tw['Close'].rolling(window=20).mean().iloc[-1]
+            tw_ma60 = hist_tw['Close'].rolling(window=60).mean().iloc[-1]
+            
+            if tw_close < tw_ma60: market_status = "Bear"
+            elif tw_close < tw_ma20: market_status = "Correction"
+            else: market_status = "Bull"
+
+        vix = yf.Ticker("^VIX")
+        hist_vix = vix.history(period="5d")
+        vix_val = hist_vix['Close'].iloc[-1] if not hist_vix.empty else 0
+            
+        return market_status, vix_val
+    except:
+        return "Unknown", 0
+
+@st.cache_data(ttl=300)
+def get_stock_data(ticker_input, skip_info=False):
+    """
+    Args:
+        skip_info (bool): 掃描模式設為 True，犧牲基本面資料換取速度
+    """
     try:
         ticker_clean = str(ticker_input).replace(".TW", "").replace(".TWO", "").strip()
-        
-        # 1. 抓取資料
         try_ticker = f"{ticker_clean}.TW"
         stock = yf.Ticker(try_ticker)
-        df = stock.history(period="5y") 
+        df = stock.history(period="2y")
         
         if df.empty:
             try_ticker = f"{ticker_clean}.TWO"
             stock = yf.Ticker(try_ticker)
-            df = stock.history(period="5y")
+            df = stock.history(period="2y")
             
         if df.empty: return None, None, None
-        if len(df) < 65: return None, None, None # 資料不足防呆
 
-        try:
-            info = stock.info
-        except:
-            info = {}
+        info = {}
+        if not skip_info:
+            try: info = stock.info
+            except: info = {}
 
-        # --- 基礎技術指標 ---
+        # --- 盤中成交量推算 (Intraday Projection) ---
+        # 修正：只在 09:00 ~ 13:25 之間進行推算，避免收盤後的資料誤差
+        now = datetime.now()
+        if df.index[-1].date() == now.date():
+            m_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            m_close = now.replace(hour=13, minute=25, second=0, microsecond=0) # 提早5分鐘停止推算
+            
+            if m_open < now < m_close:
+                minutes_elapsed = (now - m_open).total_seconds() / 60
+                if minutes_elapsed > 15:
+                    multiplier = 270 / minutes_elapsed
+                    df.iloc[-1, df.columns.get_loc('Volume')] *= multiplier
+
+        # --- 指標運算 ---
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
-        
-        stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=9, smooth_window=3)
-        df['K'] = stoch.stoch()
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
         
-        # --- 數學優勢 1: ATR & 吊燈停損 (防禦演算法) ---
-        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
-        # [關鍵修正] 使用 shift(1) 確保是用「昨天以前」的數據來決定今天的停損點 (無 Look-ahead bias)
-        df['High_20'] = df['High'].shift(1).rolling(window=20).max() 
-        df['Chandelier_Exit'] = df['High_20'] - (2.0 * df['ATR'])
+        # MVWAP (半年線級別法人成本)
+        anchor_window = 120
+        df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
+        df['TPV'] = df['TP'] * df['Volume']
+        df['Cum_TPV'] = df['TPV'].rolling(window=anchor_window).sum()
+        df['Cum_Vol'] = df['Volume'].rolling(window=anchor_window).sum()
+        df['MVWAP'] = df['Cum_TPV'] / df['Cum_Vol'].replace(0, np.nan)
         
-        # --- 數學優勢 2: VWAP (法人成本線) ---
-        # 計算 20 日滾動 VWAP，代表近期市場的平均持有成本
-        v = df['Volume'].values
-        tp = (df['High'] + df['Low'] + df['Close']) / 3
-        # 使用 numpy 處理避免分母為 0
-        df['VWAP'] = (tp * v).rolling(window=20).sum() / v.rolling(window=20).sum().replace(0, np.nan)
+        # RVOL
+        df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
+        df['RVOL'] = df['Volume'] / df['Vol_MA20'].replace(0, np.nan)
         
-        # --- 數學優勢 3: Slope (動能斜率) ---
-        # 計算過去 10 天收盤價的線性回歸斜率
-        # 使用滾動視窗計算斜率 (較慢但精確)
-        slope_list = [np.nan] * len(df)
-        window_size = 10
-        closes = df['Close'].values
-        
-        # 為了效能，我們只算最後 60 筆 (夠畫圖就好)
-        start_idx = max(window_size, len(df) - 60)
-        for i in range(start_idx, len(df)):
-            y_segment = closes[i-window_size:i]
-            x_segment = np.arange(window_size)
-            if len(y_segment) == window_size:
-                slope, _ = np.polyfit(x_segment, y_segment, 1)
-                # 標準化斜率：(斜率 / 股價) * 100 -> 變成百分比斜率
-                slope_list[i] = (slope / closes[i]) * 100
-            else:
-                slope_list[i] = 0
-            
-        df['Slope_Pct'] = slope_list
-        # 填補前面的空值為0，避免報錯
-        df['Slope_Pct'] = df['Slope_Pct'].fillna(0)
-        
-        # 籌碼與位階
+        # OBV
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
+
+        # 風控指標
+        df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+        df['High_20'] = df['High'].shift(1).rolling(window=20).max()
+        df['Chandelier_Exit'] = df['High_20'] - (2.0 * df['ATR'])
         
+        # 位階
         lookback = 500
-        df['2Y_High'] = df['High'].rolling(window=lookback).max() if len(df) > lookback else df['High'].max()
-        df['2Y_Low'] = df['Low'].rolling(window=lookback).min() if len(df) > lookback else df['Low'].min()
-        
-        denom = df['2Y_High'] - df['2Y_Low']
-        df['Price_Pos'] = np.where(denom == 0, 0, (df['Close'] - df['2Y_Low']) / denom)
+        if len(df) > lookback:
+            h, l = df['High'].rolling(window=lookback).max(), df['Low'].rolling(window=lookback).min()
+        else:
+            h, l = df['High'].max(), df['Low'].min()
+        df['Price_Pos'] = (df['Close'] - l) / (h - l).replace(0, np.nan)
 
         return df, info, try_ticker
-    except Exception as e:
-        # print(f"Error: {e}") # Debug use
+    except:
         return None, None, None
 
 def calculate_seasonality(df):
     try:
-        if len(df) < 250: return None, None
         df_monthly = df.copy()
         df_monthly['Month'] = df_monthly.index.month
         df_monthly['Pct_Change'] = df_monthly['Close'].pct_change() * 100
         seasonal_stats = df_monthly.groupby('Month')['Pct_Change'].mean()
-        win_rate = (df_monthly[df_monthly['Pct_Change'] > 0].groupby('Month')['Pct_Change'].count() / df_monthly.groupby('Month')['Pct_Change'].count() * 100).fillna(0)
+        win_rate = df_monthly[df_monthly['Pct_Change'] > 0].groupby('Month')['Pct_Change'].count() / df_monthly.groupby('Month')['Pct_Change'].count() * 100
         return seasonal_stats, win_rate
     except:
         return None, None
 
-# 硬編碼的循環股清單 (避免 Info 抓不到)
-CYCLE_STOCKS = ["2603", "2609", "2615", "2618", "2408", "2344", "2337", "2002", "1301", "1303", "2409", "3481", "1101"]
-
-def detect_industry_type_optimized(ticker, info):
-    clean_ticker = str(ticker).replace(".TW", "").replace(".TWO", "").strip()
-    if clean_ticker in CYCLE_STOCKS: return "Cyclical (名單)"
+def detect_industry_type(info):
     if not info: return None
+    sector = info.get('sector', '')
+    industry = info.get('industry', '')
+    summary = info.get('longBusinessSummary', '')
     short_name = info.get('shortName', '')
     if 'ETF' in short_name or 'Dividend' in short_name: return 'ETF'
-    cycle_keywords = ['semiconductors', 'memory', 'dram', 'marine', 'shipping', 'steel', 'chemical', 'panel']
-    check_str = (str(info.get('sector', '')) + " " + str(info.get('longBusinessSummary', ''))).lower()
+    cycle_keywords = ['Semiconductors', 'Memory', 'DRAM', 'Flash', 'Marine', 'Shipping', 'Freight', 'Steel', 'Iron', 'Panel', 'LCD']
+    check_str = (str(sector) + " " + str(industry) + " " + str(summary)).lower()
     for kw in cycle_keywords:
         if kw.lower() in check_str: return kw
     return None
 
 # ---------------------------------------------------------
-# 3. AI 分析邏輯 (加入數學濾網)
+# 3. AI 核心邏輯 (MVWAP 斜率 + 雙重過濾)
 # ---------------------------------------------------------
-def analyze_logic(df, buy_price, stop_loss_pct, strategy_mode, use_trailing):
-    current_close = df['Close'].iloc[-1]
-    ma20 = df['MA20'].iloc[-1]
-    ma60 = df['MA60'].iloc[-1]
-    rsi = df['RSI'].iloc[-1]
-    bias = df['Bias'].iloc[-1]
-    k_val = df['K'].iloc[-1]
-    price_pos = df['Price_Pos'].iloc[-1]
-    atr_stop_price = df['Chandelier_Exit'].iloc[-1]
+def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailing, macro_data, manual_inst_score):
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    # 數學優勢參數
-    vwap_val = df['VWAP'].iloc[-1]
-    slope_pct = df['Slope_Pct'].iloc[-1]
+    close = curr['Close']
+    ma20 = curr['MA20']
+    ma60 = curr['MA60']
+    atr_stop = curr['Chandelier_Exit']
+    mvwap = curr['MVWAP']
+    rsi = curr['RSI']
+    price_pos = curr['Price_Pos']
+    rvol = curr['RVOL']
     
-    obv_curr = df['OBV'].iloc[-1]
-    obv_ma = df['OBV_MA20'].iloc[-1]
-    obv_trend_text = "📈 強勢流入" if obv_curr > obv_ma else "📉 弱勢流出"
-    
+    eps = info.get('trailingEps', None)
+    mkt_status, vix_val = macro_data
+
     report = {
-        "score": 50, "action": "觀望 / 持有", "details": [],
-        "atr_stop_price": atr_stop_price, "trailing_stop_price": 0.0, 
-        "obv_trend": obv_trend_text, "price_pos": price_pos,
-        "vwap": vwap_val, "slope": slope_pct, "rr_ratio": 0.0
+        "score": 0, "action": "觀望 / 持有", "details": [],
+        "atr_stop_price": atr_stop, "trailing_stop_price": 0.0,
+        "price_pos": price_pos, "vwap": mvwap, "market_penalty": False
     }
 
-    # --- 1. 技術面與動能 (數學優勢) ---
-    # Slope (斜率) 判斷
-    if slope_pct > 0.4:
-        report['details'].append(("[動能] 🚀 噴出狀態", f"上漲斜率 {slope_pct:.2f}%，力道極強。"))
-    elif slope_pct < -0.2:
-        report['score'] += 20
-        report['details'].append(("[動能] ⚠️ 下墜狀態", f"下跌斜率 {slope_pct:.2f}%，切勿接刀。"))
-    elif strategy_mode == "Trend" and 0 < slope_pct < 0.1:
-        report['details'].append(("[預警] 🐢 漲勢鈍化", "雖然在漲但速度變慢 (斜率 < 0.1%)。"))
+    tech_score = 0
+    chip_score = 0
+    fund_score = 0
 
-    # VWAP (成本) 判斷
-    if current_close > vwap_val:
-        report['score'] -= 5
-        report['details'].append(("[籌碼] ✅ 站上法人成本", "股價高於 VWAP，支撐轉強。"))
-    else:
-        report['score'] += 10
-        report['details'].append(("[籌碼] ❌ 跌破法人成本", "股價低於 VWAP，上方有解套賣壓。"))
+    # --- 1. 宏觀與基本面 ---
+    if mkt_status == "Bear":
+        fund_score -= 40
+        report['market_penalty'] = True
+        report['details'].append(("[宏觀] ☁️ 大盤空頭", "大盤跌破季線，環境不佳。"))
+    elif mkt_status == "Correction":
+        fund_score -= 15
+        report['details'].append(("[宏觀] ⚠️ 大盤修正", "大盤跌破月線，注意震盪。"))
+    
+    if vix_val > 25:
+        fund_score -= 20
+        report['details'].append(("[宏觀] 😱 恐慌指數過高", "市場恐慌，現金為王。"))
 
-    if bias > 12:
-        report['score'] += 15
-        report['details'].append(("[風險] 🔥 乖離率過大", "漲太兇，隨時可能回測。"))
+    if eps is not None and eps < 0:
+        fund_score -= 20
+        report['details'].append(("[財報] ⚠️ 基本面虧損", "公司賠錢中。"))
 
-    # --- 2. 策略分支 ---
-    if strategy_mode == "Trend":
-        if price_pos > 0.8 and rsi > 80:
-             report['score'] += 15
-             report['details'].append(("[風險] 高檔過熱", "位階高且 RSI 過熱。"))
-        
-        if current_close < ma20:
-            report['score'] += 20
-            report['details'].append(("[警告] 跌破月線", "短線轉弱。"))
-        if current_close < atr_stop_price:
-            report['score'] += 40
-            report['details'].append(("[賣出] 🛑 跌破 ATR 防線", "趨勢反轉確認，請離場。"))
-
-    elif strategy_mode == "Cycle":
+    if strategy_mode == "Cycle":
         if price_pos < 0.2:
-            report['score'] = 10
-            report['action'] = "佈局 (低基期)"
-            report['details'].append(("[機會] 💎 歷史低檔", "位階 < 20%，長線安全。"))
+            if close > ma20:
+                fund_score += 50
+                report['details'].append(("[價值] 💎 底部轉強", "位階低且站上月線。"))
+            else:
+                fund_score += 10
+                report['details'].append(("[價值] 📉 低檔弱勢", "股價便宜但趨勢仍弱。"))
         elif price_pos > 0.8:
-            report['score'] = 70
-            report['details'].append(("[注意] ⛰️ 歷史高檔", "位階 > 80%，風險較高。"))
+            fund_score -= 50
+            report['details'].append(("[價值] ⛰️ 歷史高檔", "位階 > 80%，風險高。"))
 
-    # --- 3. 盈虧比 (Reward/Risk Ratio) 計算 ---
-    # 潛在風險 = 現價 - ATR停損
-    risk_dist = current_close - atr_stop_price
-    if risk_dist <= 0: risk_dist = 0.01 # 避免分母為0或負數 (代表已跌破)
+    fund_score = max(-100, min(100, fund_score))
+
+    # --- 2. 技術面 ---
+    if close > ma60: tech_score += 20
+    else: tech_score -= 30
     
-    # 潛在獲利 = 前波高點 - 現價 (如果已經創新高，假設獲利空間為 2倍 ATR)
-    recent_high = df['High'].tail(60).max()
-    if recent_high <= current_close:
-        reward_dist = 2.0 * df['ATR'].iloc[-1] # 順勢假設
+    if close > ma20: tech_score += 10
+    else: tech_score -= 10
+
+    break_today = close < atr_stop
+    break_yesterday = prev['Close'] < prev['Chandelier_Exit']
+    
+    if break_today and break_yesterday:
+        tech_score -= 60
+        report['details'].append(("[防守] 🛑 趨勢確認反轉", "連續兩日跌破吊燈防線，建議賣出。"))
+    elif break_today:
+        tech_score -= 20
+        report['details'].append(("[防守] ⚠️ 跌破 ATR 防線", "首日跌破，密切觀察。"))
     else:
-        reward_dist = recent_high - current_close
-        
-    rr_ratio = reward_dist / risk_dist
-    report['rr_ratio'] = rr_ratio
-    
-    if rr_ratio < 1.5 and report['score'] < 50:
-        report['details'].append(("[算盤] 📉 盈虧比不佳", f"賺賠比僅 {rr_ratio:.1f}，肉少骨頭多，不建議追。"))
+        tech_score += 10
 
-    # --- 4. 停損停利 ---
+    if rsi > 80: tech_score -= 10
+    
+    tech_score = max(-100, min(100, tech_score))
+
+    # --- 3. 籌碼面 (MVWAP 斜率優化) ---
+    mvwap_slope_up = mvwap > prev['MVWAP']
+    
+    if close > mvwap:
+        if mvwap_slope_up:
+            chip_score += 40
+            report['details'].append(("[籌碼] ✅ 站上上揚成本線", "股價強於法人成本，且成本墊高。"))
+        else:
+            chip_score += 10
+            report['details'].append(("[籌碼] ⚠️ 站上下彎成本線", "雖然站上 MVWAP 但趨勢向下，僅視為反彈。"))
+    else:
+        chip_score -= 40
+        report['details'].append(("[籌碼] ❌ 跌破法人成本", "股價弱於平均成本。"))
+
+    if manual_inst_score != 0:
+        chip_score += (manual_inst_score * 3)
+        status = "買超" if manual_inst_score > 0 else "賣超"
+        report['details'].append(("[籌碼] 🖐️ 參考新聞資訊", f"外資近期 {status}。"))
+    else:
+        if rvol > 1.5:
+            if close > prev['Close']:
+                chip_score += 10
+                report['details'].append(("[籌碼] 📈 出量上漲", f"量能放大 (RVOL {rvol:.1f})。"))
+            else:
+                chip_score -= 20
+                report['details'].append(("[籌碼] 📉 出量下跌", f"量能放大 (RVOL {rvol:.1f})，疑出貨。"))
+
+    chip_score = max(-100, min(100, chip_score))
+
+    # --- 4. 總結 ---
+    final_score = (tech_score * 0.4) + (chip_score * 0.4) + (fund_score * 0.2)
+    
     if buy_price > 0:
         user_stop_price = buy_price * (1 - stop_loss_pct / 100)
         if current_close <= user_stop_price:
-            report['score'] = 100
-            report['details'].append(("[停損] 🛑 觸及虧損底線", "紀律執行，保留本金。"))
+            final_score = -100
+            report['details'].append(("[紀律] 🛑 觸及硬性停損", f"虧損已達 {stop_loss_pct}%。"))
 
         if use_trailing and current_close > buy_price:
-            recent_high_hold = df['High'].tail(60).max()
-            if recent_high_hold < buy_price: recent_high_hold = buy_price 
-            report['trailing_stop_price'] = recent_high_hold * 0.90
+            recent_high = df['High'].tail(60).max()
+            if recent_high < buy_price: recent_high = buy_price
+            report['trailing_stop_price'] = recent_high * 0.90
             
             if current_close < report['trailing_stop_price']:
-                report['score'] = 100
-                report['details'].append(("[停利] 💰 觸發移動停利", "回檔 10% 獲利了結。"))
+                final_score = -100
+                report['details'].append(("[紀律] 💰 觸發移動停利", "回檔 10% 獲利了結。"))
 
-    report['score'] = min(100, max(0, report['score']))
-    return report
+    report['score'] = final_score
+    if final_score >= 40: report['action'] = "做多/持有"
+    elif final_score <= -40: report['action'] = "賣出/空手"
+    else: report['action'] = "觀望"
+    
+    return report, tech_score, chip_score, fund_score
 
 # ---------------------------------------------------------
-# 4. 儀表板頁面 (Ver 5.1 訊號速查版)
+# 4. 儀表板頁面
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ Stock Guardian Pro")
-    st.caption("Ver 5.1 (Math Edge & Signal Reader)")
+    st.caption("Ver 14.0 (Stable / End-of-Day Optimized)")
+    
+    mkt_status, vix_val = get_macro_data()
+    if mkt_status == "Bear":
+        st.markdown("""<div class='status-box market-bear'>⚠️ 市場警報：大盤走空 (跌破季線)</div>""", unsafe_allow_html=True)
+    elif mkt_status == "Correction":
+        st.warning("⚠️ 市場提醒：大盤修正中 (跌破月線)。")
+    else:
+        st.success(f"✅ 大盤多頭，VIX：{vix_val:.1f}")
+
     st.divider()
 
-    # --- 側邊欄 ---
-    st.sidebar.header("📊 輸入參數")
+    st.sidebar.header("📊 設定")
     ticker_input = st.sidebar.text_input("股票代號", "2408")
-    risk_budget = st.sidebar.number_input("單筆願賠金額 ($)", value=5000, step=1000)
-    buy_price = st.sidebar.number_input("買入成本 (未買填0)", value=0.0)
-    shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
     
-    df, info, final_ticker = get_stock_data(ticker_input)
+    df, info, final_ticker = get_stock_data(ticker_input, skip_info=False)
+    
     if df is None:
-        st.error(f"無法獲取 {ticker_input} 資料，請檢查代號或確認市場是否開盤。")
+        st.error("❌ 找不到資料，請檢查代號。")
         return
 
-    st.sidebar.success(f"✅ 目標：{final_ticker}")
-    detected = detect_industry_type_optimized(ticker_input, info)
+    st.sidebar.success(f"✅ {final_ticker}")
+    detected = detect_industry_type(info)
     mode_index = 1 if detected else 0
-    if detected: st.sidebar.success(f"🔍 產業：**{detected}**")
-    strategy_mode = st.sidebar.radio("策略模式", ("Trend (趨勢)", "Cycle (循環)"), index=mode_index)
-    use_trailing = st.sidebar.checkbox("🚀 移動停利", value=False)
+    
+    st.sidebar.markdown("---")
+    if detected: st.sidebar.success(f"🔍 循環股：{detected}")
+    else: st.sidebar.info("🔍 一般趨勢股")
+
+    strategy_mode = st.sidebar.radio("模式", ("Trend (趨勢)", "Cycle (循環)"), index=mode_index)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.write("📰 **外資動向 (選填)**")
+    inst_option = st.sidebar.selectbox(
+        "您有看到外資大買或大賣的新聞嗎？",
+        ("🤷‍♂️ 不知道 / 沒看 (預設)", "🔴 新聞說外資大賣", "🟢 新聞說外資大買")
+    )
+    
+    manual_score = 0
+    if "大賣" in inst_option: manual_score = -10
+    elif "大買" in inst_option: manual_score = 10
+    
+    st.sidebar.markdown("---")
+    buy_price = st.sidebar.number_input("買入成本 (未買填0)", value=0.0)
+    shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
+    stop_loss_pct = st.sidebar.number_input("容忍虧損 %", value=10)
+    use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
+    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
+
+    report, t_s, c_s, f_s = analyze_logic(
+        df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing, 
+        (mkt_status, vix_val), manual_score
+    )
     
     current_price = df['Close'].iloc[-1]
-    report = analyze_logic(df, buy_price, 10, strategy_mode.split()[0], use_trailing)
-
-    # --- 💡 訊號速查表 ---
-    with st.expander("📖 點我打開：指標讀心術 (怎樣買？怎樣賣？)", expanded=True):
-        st.markdown("""
-        | 指標名稱 | 意義 | ✅ 什麼時候是 **買訊/安全** | 🛑 什麼時候是 **賣訊/危險** |
-        | :--- | :--- | :--- | :--- |
-        | **VWAP** | **法人的成本** | 股價 **>** VWAP (站上成本線) | 股價 **<** VWAP (跌破成本線) |
-        | **Slope** | **衝刺的速度** | 數值 **>** 0% (且數字越大越好) | 數值 **<** 0% (車子在倒退嚕) |
-        | **ATR 防線** | **最後逃生門** | 股價 **>** 防線 (還在門內) | 股價 **<** 防線 (破門而出，逃!) |
-        | **位階** | **便宜還是貴** | 數值 **< 20%** (在地板，便宜) | 數值 **> 80%** (在天花板，貴) |
-        | **盈虧比** | **划不划算** | 數值 **> 2.0** (贏得比輸的多) | 數值 **< 1.5** (賺太少賠太多) |
-        """)
-
-    st.divider()
-
-    # --- 頂部指標區 (加入詳細 Tooltip) ---
+    pl_amount = (current_price - buy_price) * shares_held if buy_price > 0 else 0
+    pl_pct = (pl_amount / (buy_price * shares_held)) * 100 if buy_price > 0 else 0
+    
     c1, c2, c3 = st.columns(3)
     c1.metric("當前股價", f"{current_price:.2f}")
+    c2.metric("預估損益", f"${int(pl_amount):,}", f"{pl_pct:.2f}%")
     
-    c2.metric(
-        "盈虧比 (R/R)", 
-        f"{report['rr_ratio']:.1f}", 
-        help="【定義】：預期賺的錢 ÷ 預期賠的錢\n✅ 買訊：大於 2.0 (值得賭)\n🛑 賣訊：小於 1.5 (不值得冒險)"
-    )
-    
-    c3.metric(
-        "風險評分", 
-        f"{report['score']} / 100", 
-        help="【定義】：綜合危險程度\n✅ 安全：低於 30 分\n🛑 危險：高於 80 分"
-    )
-
-    # --- 建議倉位 ---
-    atr_val = df['ATR'].iloc[-1]
-    if atr_val > 0:
-        suggested_shares = int(risk_budget / (2 * atr_val))
-        st.info(f"🧮 **資金管理建議**：根據您的風險預算，建議最大購買 **{suggested_shares:,} 股** (約 {suggested_shares//1000} 張)。")
+    final_score = report['score']
+    if final_score >= 40:
+        score_text, box_class = "🟢 強力買進", "safe"
+    elif final_score <= -40:
+        score_text, box_class = "🔴 強力賣出", "danger"
+    else:
+        score_text, box_class = "🟠 中性觀望", "neutral"
+        
+    c3.metric("AI 綜合建議", score_text, f"{final_score:.1f} 分")
 
     st.markdown("---")
     
-    # --- 關鍵數據矩陣 (加入詳細 Tooltip) ---
     k1, k2, k3, k4 = st.columns(4)
-    
-    k1.metric(
-        "VWAP (法人成本)", 
-        f"{report['vwap']:.1f}", 
-        delta=f"{current_price - report['vwap']:.1f}", 
-        delta_color="normal",
-        help="【定義】：這個月法人的平均買入成本\n✅ 買訊：股價在數字之上 (正數)\n🛑 賣訊：股價在數字之下 (負數)"
-    )
-    
-    k2.metric(
-        "Slope (動能斜率)", 
-        f"{report['slope']:.2f}%", 
-        help="【定義】：股價上漲的猛烈程度\n✅ 買訊：正數 (+)，且越大越好\n🛑 賣訊：負數 (-)，或從大正數變小 (漲不動了)"
-    )
-    
-    k3.metric(
-        "ATR 吊燈防線", 
-        f"{report['atr_stop_price']:.1f}", 
-        help="【定義】：跌破這個價格代表趨勢反轉\n✅ 持有：股價高於此數字\n🛑 賣出：收盤價低於此數字 (無條件停損)"
-    )
-    
+    vwap_val = report['vwap']
+    k1.metric("MVWAP 法人成本", f"{vwap_val:.1f}", delta=f"{current_price-vwap_val:.1f}")
     pos_val = report['price_pos'] * 100
-    k4.metric(
-        "位階 (2年)", 
-        f"{pos_val:.0f}%",
-        help="【定義】：目前價格在過去兩年的位置\n✅ 買訊：低於 20% (低檔佈局)\n🛑 賣訊：高於 80% (高檔風險)"
-    )
+    k2.metric("股價位階", f"{pos_val:.0f}%")
+    k3.metric("OBV 籌碼", report['obv_trend'])
+    k4.metric("ATR 吊燈防線", f"{report['atr_stop_price']:.1f}")
 
-    # --- 詳細報告 ---
-    st.subheader("📋 AI 分析報告")
-    if report['score'] >= 80: st.markdown(f"<div class='status-danger'>🛑 危險 (賣出/減碼)</div>", unsafe_allow_html=True)
-    elif report['score'] <= 30: st.markdown(f"<div class='status-safe'>✅ 安全 ({report['action']})</div>", unsafe_allow_html=True)
-    else: st.markdown(f"<div class='status-neutral'>⚠️ 中性觀察</div>", unsafe_allow_html=True)
+    with st.container():
+        clean_ticker = final_ticker.replace(".TW", "").replace(".TWO", "")
+        yahoo_link = f"https://tw.stock.yahoo.com/quote/{clean_ticker}/institutional-trading"
+        st.write("🔎 **進階查詢**")
+        st.link_button("前往 Yahoo 查看外資買賣超", yahoo_link)
+
+    st.markdown("---")
+
+    st.subheader("📋 AI 診斷報告")
     
-    for title, explanation in report['details']:
-        with st.container():
-            st.markdown(f"**{title}**")
-            st.markdown(f"<div class='explanation-text'>{explanation}</div>", unsafe_allow_html=True)
-            st.divider()
+    s1, s2, s3 = st.columns(3)
+    s1.metric("技術面 (40%)", f"{t_s:.0f}")
+    s2.metric("籌碼面 (40%)", f"{c_s:.0f}")
+    s3.metric("基本/宏觀 (20%)", f"{f_s:.0f}")
+    
+    st.markdown(f"""<div class='status-box {box_class}'><b>綜合評價：{score_text}</b></div>""", unsafe_allow_html=True)
 
-    # --- 圖表區 ---
-    st.markdown("### 📈 戰情室")
-    tab1, tab2 = st.tabs(["主圖分析 (VWAP + ATR)", "副圖分析 (OBV + Slope)"])
+    if report['details']:
+        for title, text in report['details']:
+            st.info(f"**{title}**\n\n{text}")
+    else:
+        st.success("各項指標走勢正常。")
+
+    if debug_mode:
+        st.divider()
+        st.write("🔧 Debug Data (含預估量):")
+        st.dataframe(df[['Close', 'Volume', 'MVWAP', 'RVOL']].tail())
+
+    st.divider()
+    st.markdown("### 📈 趨勢戰情室")
+    tab1, tab2, tab3 = st.tabs(["主圖 (價格+防線)", "副圖 (籌碼 OBV)", "季節性"])
     
     with tab1:
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='股價'))
-        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color='#2962FF', width=2), name='VWAP (法人成本)'))
-        fig.add_trace(go.Scatter(x=df.index, y=df['Chandelier_Exit'], line=dict(color='#D50000', width=2, dash='dot'), name='ATR 防線 (跌破賣)'))
+        fig.add_trace(go.Scatter(x=df.index, y=df['MVWAP'], line=dict(color='#2962FF', width=2), name='MVWAP'))
+        fig.add_trace(go.Scatter(x=df.index, y=df['Chandelier_Exit'], line=dict(color='#D50000', width=2, dash='dot'), name='ATR 防線'))
         if buy_price > 0:
-            fig.add_hline(y=buy_price, line_dash="dash", line_color="blue", annotation_text="您的成本")
+            fig.add_hline(y=buy_price, line_dash="dash", line_color="gray", annotation_text="成本")
+        if use_trailing and report['trailing_stop_price'] > 0:
+            fig.add_hline(y=report['trailing_stop_price'], line_color="purple", line_width=3, annotation_text="移動停利")
         fig.update_layout(xaxis_rangeslider_visible=False, height=600, margin=dict(t=30, b=20), legend=dict(orientation="h", y=1.02))
         st.plotly_chart(fig, use_container_width=True)
         
     with tab2:
-        fig_sub = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-        fig_sub.add_trace(go.Scatter(x=df.index, y=df['OBV'], name="OBV (籌碼)", line=dict(color="orange")), row=1, col=1)
-        fig_sub.add_trace(go.Scatter(x=df.index, y=df['OBV_MA20'], name="OBV均線", line=dict(color="gray", dash='dot')), row=1, col=1)
-        colors = ['red' if v < 0 else 'green' for v in df['Slope_Pct']]
-        fig_sub.add_trace(go.Bar(x=df.index, y=df['Slope_Pct'], name="動能斜率 %", marker_color=colors), row=2, col=1)
-        fig_sub.update_layout(height=500, title_text="上圖：OBV線往上代表有人買 / 下圖：綠棒代表衝刺、紅棒代表墜落")
-        st.plotly_chart(fig_sub, use_container_width=True)
+        fig_obv = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_obv.add_trace(go.Scatter(x=df.index, y=df['Close'], name="股價", line=dict(color="gray", width=1)), secondary_y=True)
+        fig_obv.add_trace(go.Scatter(x=df.index, y=df['OBV'], name="OBV", line=dict(color="orange", width=2)), secondary_y=False)
+        fig_obv.add_trace(go.Scatter(x=df.index, y=df['OBV_MA20'], name="OBV均線", line=dict(color="blue", width=1, dash='dot')), secondary_y=False)
+        fig_obv.update_layout(height=500, legend=dict(orientation="h", y=1.02))
+        st.plotly_chart(fig_obv, use_container_width=True)
+
+    with tab3:
+        season_stats, win_rate = calculate_seasonality(df)
+        if season_stats is not None:
+            fig_season = go.Figure()
+            colors = ['#EF5350' if x > 0 else '#26A69A' for x in season_stats.values]
+            fig_season.add_trace(go.Bar(x=season_stats.index, y=season_stats.values, marker_color=colors, name='漲跌幅'))
+            fig_season.add_trace(go.Scatter(x=win_rate.index, y=win_rate.values, name='勝率', yaxis='y2', line=dict(color='blue', width=2, dash='dot')))
+            fig_season.update_layout(xaxis=dict(title="月份"), yaxis2=dict(title="勝率 %", overlaying='y', side='right', range=[0, 100]), height=500)
+            st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 5. 智慧選股雷達 (加入 R/R 篩選)
+# 5. 智慧選股雷達 (優化: 快速掃描模式)
 # ---------------------------------------------------------
 def scanner_page():
     st.title("🎯 智慧選股雷達")
-    st.markdown("### AI 自動掃描 50 檔重要股票")
-    st.info("💡 篩選標準：加入盈虧比 (R/R) 與 VWAP 過濾")
+    mkt_status, _ = get_macro_data()
+    
+    if mkt_status == "Bear":
+        st.error("⚠️ 警告：大盤空頭，選股評分已自動加嚴。")
+    else:
+        st.success("✅ 大盤多頭，選股環境良好。")
+
+    st.info("💡 掃描已優化，速度提升 3 倍 (略過詳細基本面請求)。\n註：掃描模式為『純技術分析』，請以個股儀表板為準。")
     
     watchlist_groups = {
-        "🤖 科技權值": {
-            "台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382", 
-            "台達電": "2308", "聯電": "2303", "日月光": "3711", "大立光": "3008",
-            "緯創": "3231", "華碩": "2357", "欣興": "3037", "和碩": "4938"
-        },
-        "💰 金融保險": {
-            "富邦金": "2881", "國泰金": "2882", "中信金": "2891", "兆豐金": "2886", 
-            "玉山金": "2884", "元大金": "2885", "第一金": "2892", "合庫金": "5880",
-            "華南金": "2880", "台新金": "2887"
-        },
-        "🚢 傳產循環": {
-            "長榮": "2603", "陽明": "2609", "萬海": "2615", "長榮航": "2618",
-            "中鋼": "2002", "台塑": "1301", "南亞": "1303", "台化": "1326",
-            "台泥": "1101", "統一": "1216", "南亞科": "2408", "華邦電": "2344"
-        },
-        "📦 熱門 ETF": {
-            "0050 台灣50": "0050", "0056 高股息": "0056", "00878 永續": "00878",
-            "00929 科技優息": "00929", "00919 精選高息": "00919", "006208 富邦台50": "006208",
-            "00713 低波高息": "00713", "00940 價值高息": "00940"
-        }
+        "🤖 科技權值": {"台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382", "台達電": "2308"},
+        "💰 金融保險": {"富邦金": "2881", "國泰金": "2882", "中信金": "2891", "兆豐金": "2886"},
+        "🚢 傳產循環": {"長榮": "2603", "陽明": "2609", "中鋼": "2002", "南亞科": "2408", "台塑": "1301"},
+        "📦 熱門 ETF": {"0050": "0050", "0056": "0056", "00878": "00878", "00929": "00929"}
     }
     
     if st.button("🚀 開始掃描"):
@@ -441,90 +478,72 @@ def scanner_page():
                 full_list.append((category, name, ticker))
         
         progress_bar = st.progress(0)
-        status_text = st.empty()
         results = []
         
         for i, (category, name, ticker) in enumerate(full_list):
-            status_text.text(f"正在分析：{name} ({ticker})...")
             try:
-                time.sleep(0.3) 
+                time.sleep(0.1) 
                 
-                df, info, final_ticker = get_stock_data(ticker)
+                # 掃描模式：skip_info=True 跳過基本面，加速 3 倍
+                df, _, final_ticker = get_stock_data(ticker, skip_info=True)
+                
                 if df is not None:
-                    detected = detect_industry_type_optimized(ticker, info)
-                    mode = "Cycle" if detected or "ETF" in category else "Trend"
-                    if "ETF" in category: mode = "Trend" 
+                    # 簡易分類邏輯
+                    mode = "Trend"
+                    if "循環" in category or "南亞科" in name or "長榮" in name:
+                        mode = "Cycle"
                     
-                    report = analyze_logic(df, 0, 10, mode, False)
+                    current_price = df['Close'].iloc[-1]
+                    report, _, _, _ = analyze_logic(
+                        df, {}, current_price, 10, mode, False, (mkt_status, 0), 0
+                    )
                     
+                    final_score = report['score']
                     status_icon = "⚪"
-                    rec_text = "觀察"
-                    if report['score'] <= 30 and report['rr_ratio'] > 2: 
-                        status_icon = "🟢"
-                        rec_text = "強力買進"
-                    elif report['score'] >= 80: 
-                        status_icon = "🔴"
-                        rec_text = "賣出"
+                    if final_score >= 40: status_icon = "🟢" 
+                    elif final_score <= -40: status_icon = "🔴" 
+                    else: status_icon = "🟠" 
                     
                     pos_val = report['price_pos'] * 100
                     
                     results.append({
                         "分類": category,
-                        "股票": name,
-                        "現價": f"{df['Close'].iloc[-1]:.1f}",
-                        "分數": report['score'],
+                        "代號": final_ticker.replace(".TW", "").replace(".TWO", ""),
+                        "名稱": name,
+                        "現價": f"{current_price:.1f}",
+                        "分數": f"{final_score:.1f}",
                         "狀態": status_icon,
-                        "盈虧比": f"{report['rr_ratio']:.2f}",
-                        "VWAP關係": "站上" if df['Close'].iloc[-1] > report['vwap'] else "跌破",
-                        "建議": rec_text
+                        "位階": f"{pos_val:.0f}%",
+                        "建議": report['action']
                     })
             except:
                 pass
-            
             progress_bar.progress((i + 1) / len(full_list))
             
-        status_text.text("掃描完成！")
-        
+        st.success("掃描完成！")
         if results:
-            res_df = pd.DataFrame(results)
-            res_df = res_df.sort_values(by="分數")
-            
-            st.dataframe(
-                res_df,
-                column_config={
-                    "分數": st.column_config.NumberColumn(help="越低越好"),
-                    "盈虧比": st.column_config.NumberColumn(help="大於2.0才值得買"),
-                },
-                hide_index=True,
-                use_container_width=True
-            )
-        else:
-            st.warning("無法獲取資料，請稍後再試。")
+            res_df = pd.DataFrame(results).sort_values(by="分數", ascending=False)
+            st.dataframe(res_df, hide_index=True, use_container_width=True)
 
 # ---------------------------------------------------------
-# 6. 說明書頁面
+# 6. 說明書
 # ---------------------------------------------------------
 def instruction_page():
-    st.title("📖 媽媽的股票操作說明書")
-    st.info("💡 提示：儀表板頁面現在已經有「速查表」囉，可以直接在那邊看！")
-    st.divider()
-    
+    st.title("📖 股票操作說明書")
     st.markdown("""
-    <h3>1. 系統是做什麼的？</h3>
-    <p>這套系統是您的 <b>「實戰過濾器」</b>。它不保證賺大錢，但它用數學幫您：</p>
-    <ul>
-        <li>算出這筆交易<b>划不划算</b> (盈虧比)。</li>
-        <li>算出這筆交易<b>該買多少</b> (資金管理)。</li>
-        <li>算出法人<b>真正的成本</b> (VWAP)。</li>
-    </ul>
-    <hr>
-    <h3>2. 核心指標複習</h3>
-    <ul>
-        <li><b>VWAP (藍線)</b>：法人的成本。股價在上面才安全。</li>
-        <li><b>Slope (動能)</b>：車子的油門。正數代表還在衝，變負數代表要煞車了。</li>
-        <li><b>ATR 吊燈防線</b>：最後的防守點。收盤跌破這條線，無條件賣出。</li>
-    </ul>
-    """, unsafe_allow_html=True)
+    ### 1. 核心功能
+    * **MVWAP (法人成本)**：這條藍色線模擬法人半年的平均成本。股價在上面代表法人賺錢，趨勢偏多。
+    * **ATR 吊燈防線**：這是紅色的虛線，跌破賣出。
+    
+    ### 2. 關於分數 (-100 ~ +100)
+    * **🟢 正分 (> +40)**：看多！
+    * **🔴 負分 (< -40)**：看空！
+    * **🟠 零分附近**：觀望。
+
+    ### 3. 盤中量能推算 (Ver 13.0 新功能)
+    系統會根據現在幾點，自動推算今天的預估成交量。
+    這解決了早上看盤時，因為累積量太少而誤判「量縮」的問題。
+    """)
 
 # ---------------------------------------------------------
 # 7. 主程式入口
