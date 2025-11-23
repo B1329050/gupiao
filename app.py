@@ -5,7 +5,7 @@ import numpy as np
 import ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 import time
 
 # ---------------------------------------------------------
@@ -15,7 +15,6 @@ st.set_page_config(page_title="Stock Guardian Pro", layout="wide", page_icon="�
 
 st.markdown("""
     <style>
-    /* 狀態通知框 */
     .status-box { 
         padding: 15px; 
         border-radius: 10px; 
@@ -34,28 +33,26 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- Tooltip 小工具 ---
+def tooltip(text, desc):
+    return f'<abbr title="{desc}">{text}</abbr>'
+
 # ---------------------------------------------------------
-# 2. 資料獲取層
+# 2. 資料獲取層 (最穩定的版本)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=1800)
 def get_macro_data():
-    """抓取大盤與恐慌指數"""
+    """抓取大盤"""
     try:
         twii = yf.Ticker("^TWII")
         hist_tw = twii.history(period="6mo")
+        if hist_tw.empty: return "Unknown", 0
         
-        if hist_tw.empty:
-            market_status = "Unknown"
-        else:
-            tw_close = hist_tw['Close'].iloc[-1]
-            tw_ma20 = hist_tw['Close'].rolling(window=20).mean().iloc[-1]
-            tw_ma60 = hist_tw['Close'].rolling(window=60).mean().iloc[-1]
-            
-            if tw_close < tw_ma60: market_status = "Bear"
-            elif tw_close < tw_ma20: market_status = "Correction"
-            else: market_status = "Bull"
-
+        tw_close = hist_tw['Close'].iloc[-1]
+        tw_ma60 = hist_tw['Close'].rolling(window=60).mean().iloc[-1]
+        market_status = "Bear" if tw_close < tw_ma60 else "Bull"
+        
         vix = yf.Ticker("^VIX")
         hist_vix = vix.history(period="5d")
         vix_val = hist_vix['Close'].iloc[-1] if not hist_vix.empty else 0
@@ -65,41 +62,29 @@ def get_macro_data():
         return "Unknown", 0
 
 @st.cache_data(ttl=300)
-def get_stock_data(ticker_input, skip_info=False):
+def get_stock_data(ticker_input):
     """
-    Args:
-        skip_info (bool): 掃描模式設為 True，犧牲基本面資料換取速度
+    抓取個股資料：只要有股價就回傳，不因為 info 失敗而報錯
     """
     try:
         ticker_clean = str(ticker_input).replace(".TW", "").replace(".TWO", "").strip()
+        
+        # 1. 嘗試上市
         try_ticker = f"{ticker_clean}.TW"
         stock = yf.Ticker(try_ticker)
         df = stock.history(period="2y")
         
+        # 2. 嘗試上櫃
         if df.empty:
             try_ticker = f"{ticker_clean}.TWO"
             stock = yf.Ticker(try_ticker)
             df = stock.history(period="2y")
             
-        if df.empty: return None, None, None
+        if df.empty: return None, {}, None # 真的抓不到
 
-        info = {}
-        if not skip_info:
-            try: info = stock.info
-            except: info = {}
-
-        # --- 盤中成交量推算 (Intraday Projection) ---
-        # 修正：只在 09:00 ~ 13:25 之間進行推算，避免收盤後的資料誤差
-        now = datetime.now()
-        if df.index[-1].date() == now.date():
-            m_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
-            m_close = now.replace(hour=13, minute=25, second=0, microsecond=0) # 提早5分鐘停止推算
-            
-            if m_open < now < m_close:
-                minutes_elapsed = (now - m_open).total_seconds() / 60
-                if minutes_elapsed > 15:
-                    multiplier = 270 / minutes_elapsed
-                    df.iloc[-1, df.columns.get_loc('Volume')] *= multiplier
+        # 3. 嘗試抓 info (失敗就算了，給空字典)
+        try: info = stock.info
+        except: info = {}
 
         # --- 指標運算 ---
         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -138,7 +123,7 @@ def get_stock_data(ticker_input, skip_info=False):
 
         return df, info, try_ticker
     except:
-        return None, None, None
+        return None, {}, None
 
 def calculate_seasonality(df):
     try:
@@ -165,7 +150,7 @@ def detect_industry_type(info):
     return None
 
 # ---------------------------------------------------------
-# 3. AI 核心邏輯 (MVWAP 斜率 + 雙重過濾)
+# 3. AI 核心邏輯
 # ---------------------------------------------------------
 def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailing, macro_data, manual_inst_score):
     curr = df.iloc[-1]
@@ -193,19 +178,12 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     chip_score = 0
     fund_score = 0
 
-    # --- 1. 宏觀與基本面 ---
+    # 1. 宏觀與基本面
     if mkt_status == "Bear":
         fund_score -= 40
         report['market_penalty'] = True
-        report['details'].append(("[宏觀] ☁️ 大盤空頭", "大盤跌破季線，環境不佳。"))
-    elif mkt_status == "Correction":
-        fund_score -= 15
-        report['details'].append(("[宏觀] ⚠️ 大盤修正", "大盤跌破月線，注意震盪。"))
+        report['details'].append(("[宏觀] ☁️ 大盤空頭", "加權指數跌破季線，建議保守。"))
     
-    if vix_val > 25:
-        fund_score -= 20
-        report['details'].append(("[宏觀] 😱 恐慌指數過高", "市場恐慌，現金為王。"))
-
     if eps is not None and eps < 0:
         fund_score -= 20
         report['details'].append(("[財報] ⚠️ 基本面虧損", "公司賠錢中。"))
@@ -224,7 +202,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
 
     fund_score = max(-100, min(100, fund_score))
 
-    # --- 2. 技術面 ---
+    # 2. 技術面
     if close > ma60: tech_score += 20
     else: tech_score -= 30
     
@@ -247,13 +225,13 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     
     tech_score = max(-100, min(100, tech_score))
 
-    # --- 3. 籌碼面 (MVWAP 斜率優化) ---
+    # 3. 籌碼面
     mvwap_slope_up = mvwap > prev['MVWAP']
     
     if close > mvwap:
         if mvwap_slope_up:
             chip_score += 40
-            report['details'].append(("[籌碼] ✅ 站上上揚成本線", "股價強於法人成本，且成本墊高。"))
+            report['details'].append(("[籌碼] ✅ 站上上揚成本線", "股價強於法人成本，多頭強勢。"))
         else:
             chip_score += 10
             report['details'].append(("[籌碼] ⚠️ 站上下彎成本線", "雖然站上 MVWAP 但趨勢向下，僅視為反彈。"))
@@ -276,7 +254,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
 
     chip_score = max(-100, min(100, chip_score))
 
-    # --- 4. 總結 ---
+    # 4. 總結
     final_score = (tech_score * 0.4) + (chip_score * 0.4) + (fund_score * 0.2)
     
     if buy_price > 0:
@@ -302,58 +280,78 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report, tech_score, chip_score, fund_score
 
 # ---------------------------------------------------------
-# 4. 儀表板頁面
+# 4. 儀表板頁面 (保證輸入框不消失)
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ Stock Guardian Pro")
-    st.caption("Ver 14.0 (Stable / End-of-Day Optimized)")
+    st.caption("Ver 15.1 (Full Control)")
     
     mkt_status, vix_val = get_macro_data()
     if mkt_status == "Bear":
         st.markdown("""<div class='status-box market-bear'>⚠️ 市場警報：大盤走空 (跌破季線)</div>""", unsafe_allow_html=True)
-    elif mkt_status == "Correction":
-        st.warning("⚠️ 市場提醒：大盤修正中 (跌破月線)。")
     else:
         st.success(f"✅ 大盤多頭，VIX：{vix_val:.1f}")
 
     st.divider()
 
-    st.sidebar.header("📊 設定")
+    # --- 側邊欄 (所有輸入框都放在這裡，保證不消失) ---
+    st.sidebar.header("📊 1. 查詢股票")
     ticker_input = st.sidebar.text_input("股票代號", "2408")
     
-    df, info, final_ticker = get_stock_data(ticker_input, skip_info=False)
+    # 為了讓側邊欄的選項在抓不到資料時也能顯示，我們先把 UI 畫出來
+    # 然後再嘗試獲取資料
     
-    if df is None:
-        st.error("❌ 找不到資料，請檢查代號。")
-        return
-
-    st.sidebar.success(f"✅ {final_ticker}")
+    # 嘗試獲取資料
+    df, info, final_ticker = get_stock_data(ticker_input)
+    
+    # 自動偵測 (如果有 info)
     detected = detect_industry_type(info)
-    mode_index = 1 if detected else 0
+    # 預設索引：如果有偵測到循環股，預設選 Cycle (index 1)，否則 Trend (index 0)
+    default_idx = 1 if detected else 0
     
+    # ★★★ 關鍵修復：模式切換按鈕回歸 ★★★
     st.sidebar.markdown("---")
-    if detected: st.sidebar.success(f"🔍 循環股：{detected}")
-    else: st.sidebar.info("🔍 一般趨勢股")
-
-    strategy_mode = st.sidebar.radio("模式", ("Trend (趨勢)", "Cycle (循環)"), index=mode_index)
+    st.sidebar.header("⚙️ 2. 策略設定")
     
-    st.sidebar.markdown("---")
-    st.sidebar.write("📰 **外資動向 (選填)**")
-    inst_option = st.sidebar.selectbox(
-        "您有看到外資大買或大賣的新聞嗎？",
-        ("🤷‍♂️ 不知道 / 沒看 (預設)", "🔴 新聞說外資大賣", "🟢 新聞說外資大買")
+    if detected:
+        st.sidebar.success(f"🔍 AI 偵測：**{detected}** (循環股)")
+    else:
+        st.sidebar.info("🔍 AI 偵測：一般趨勢股")
+        
+    strategy_mode = st.sidebar.radio(
+        "分析模式 (可手動切換)", 
+        ("Trend (趨勢)", "Cycle (循環)"), 
+        index=default_idx,
+        help="Trend：適合台積電、金融股 (破線就跑)\nCycle：適合航運、記憶體 (越跌越買)"
     )
     
+    st.sidebar.markdown("---")
+    st.sidebar.header("💰 3. 持倉設定 (選填)")
+    buy_price = st.sidebar.number_input("買入成本 (未買填0)", value=0.0)
+    shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
+    stop_loss_pct = st.sidebar.number_input("容忍虧損 %", value=10)
+    use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
+    
+    st.sidebar.markdown("---")
+    st.sidebar.header("📰 4. 外資動向 (選填)")
+    inst_option = st.sidebar.selectbox(
+        "外資買賣超？",
+        ("🤷‍♂️ 不知道 / 沒看", "🔴 新聞說外資大賣", "🟢 新聞說外資大買")
+    )
     manual_score = 0
     if "大賣" in inst_option: manual_score = -10
     elif "大買" in inst_option: manual_score = 10
     
     st.sidebar.markdown("---")
-    buy_price = st.sidebar.number_input("買入成本 (未買填0)", value=0.0)
-    shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
-    stop_loss_pct = st.sidebar.number_input("容忍虧損 %", value=10)
-    use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
     debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
+
+    # --- 主畫面邏輯 ---
+    if df is None:
+        st.error(f"❌ 找不到代號 {ticker_input} 的資料。請確認輸入正確 (例如 2330 或 0050)。")
+        return # 只有主畫面停止，側邊欄依然存在
+
+    # 若成功獲取，顯示內容
+    st.sidebar.success(f"✅ 已載入：{final_ticker}")
 
     report, t_s, c_s, f_s = analyze_logic(
         df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing, 
@@ -451,7 +449,7 @@ def dashboard_page():
             st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 5. 智慧選股雷達 (優化: 快速掃描模式)
+# 5. 智慧選股雷達
 # ---------------------------------------------------------
 def scanner_page():
     st.title("🎯 智慧選股雷達")
@@ -462,7 +460,7 @@ def scanner_page():
     else:
         st.success("✅ 大盤多頭，選股環境良好。")
 
-    st.info("💡 掃描已優化，速度提升 3 倍 (略過詳細基本面請求)。\n註：掃描模式為『純技術分析』，請以個股儀表板為準。")
+    st.info("💡 掃描約需 60 秒。")
     
     watchlist_groups = {
         "🤖 科技權值": {"台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382", "台達電": "2308"},
@@ -483,19 +481,16 @@ def scanner_page():
         for i, (category, name, ticker) in enumerate(full_list):
             try:
                 time.sleep(0.1) 
-                
-                # 掃描模式：skip_info=True 跳過基本面，加速 3 倍
-                df, _, final_ticker = get_stock_data(ticker, skip_info=True)
-                
+                df, info, final_ticker = get_stock_data(ticker)
                 if df is not None:
-                    # 簡易分類邏輯
-                    mode = "Trend"
-                    if "循環" in category or "南亞科" in name or "長榮" in name:
-                        mode = "Cycle"
+                    detected = detect_industry_type(info)
+                    mode = "Cycle" if detected or "ETF" in category else "Trend"
+                    if "ETF" in category: mode = "Trend"
                     
                     current_price = df['Close'].iloc[-1]
+                    # 掃描時手動籌碼設為 0
                     report, _, _, _ = analyze_logic(
-                        df, {}, current_price, 10, mode, False, (mkt_status, 0), 0
+                        df, info, current_price, 10, mode, False, (mkt_status, 0), 0
                     )
                     
                     final_score = report['score']
