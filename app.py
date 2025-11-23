@@ -9,41 +9,32 @@ from datetime import datetime, timedelta
 import time
 
 # ---------------------------------------------------------
-# 1. 系統設定與 CSS
+# 1. 系統設定
 # ---------------------------------------------------------
 st.set_page_config(page_title="Stock Guardian Pro", layout="wide", page_icon="🛡️")
 
 st.markdown("""
     <style>
-    .status-box { 
-        padding: 15px; 
-        border-radius: 10px; 
-        margin-bottom: 15px; 
-        border-left: 6px solid #ccc; 
-        background-color: #f9f9f9;
-    }
+    .status-box { padding: 15px; border-radius: 10px; margin-bottom: 15px; border-left: 6px solid #ccc; background-color: #f9f9f9; }
     .danger { background-color: #FFEBEE; border-color: #D32F2F; color: #C62828; }
     .safe { background-color: #E8F5E9; border-color: #2E7D32; color: #1B5E20; }
     .neutral { background-color: #FFF3E0; border-color: #EF6C00; color: #E65100; }
     .market-bear { background-color: #212121; border-color: #FF5252; color: #FF5252; } 
-    
     [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
     .explanation-text { font-size: 1rem; color: #555; margin-left: 5px; line-height: 1.5; }
     .tooltip-text { color: #0066cc; font-weight: bold; text-decoration: underline dotted; cursor: help; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Tooltip 小工具 ---
 def tooltip(text, desc):
     return f'<abbr title="{desc}">{text}</abbr>'
 
 # ---------------------------------------------------------
-# 2. 資料獲取層 (最穩定的版本)
+# 2. 資料獲取層 (強力修復版)
 # ---------------------------------------------------------
 
 @st.cache_data(ttl=1800)
 def get_macro_data():
-    """抓取大盤"""
     try:
         twii = yf.Ticker("^TWII")
         hist_tw = twii.history(period="6mo")
@@ -64,35 +55,57 @@ def get_macro_data():
 @st.cache_data(ttl=300)
 def get_stock_data(ticker_input):
     """
-    抓取個股資料：只要有股價就回傳，不因為 info 失敗而報錯
+    強力抓取邏輯：
+    1. 嘗試多種後綴 (.TW, .TWO)
+    2. 優先確保 K 線 (history) 成功
+    3. info 失敗不影響主程式
     """
+    ticker_clean = str(ticker_input).strip().upper()
+    
+    # 為了防止 Yahoo 擋截，我們準備多種格式嘗試
+    # 移除既有後綴，重新組合
+    base_ticker = ticker_clean.replace(".TW", "").replace(".TWO", "")
+    
+    # 嘗試列表
+    candidates = [f"{base_ticker}.TW", f"{base_ticker}.TWO", base_ticker]
+    
+    df = pd.DataFrame()
+    final_ticker = ""
+    info = {}
+    
+    # 1. 暴力嘗試抓取股價
+    for t in candidates:
+        try:
+            stock = yf.Ticker(t)
+            # 先抓 5 天試試水溫，比較快
+            temp_df = stock.history(period="5d")
+            if not temp_df.empty:
+                # 成功了！抓完整資料
+                df = stock.history(period="2y")
+                final_ticker = t
+                # 順便試著抓 info (但不強求)
+                try: info = stock.info
+                except: info = {}
+                break
+        except:
+            continue
+    
+    if df.empty:
+        return None, {}, None
+
+    # 2. 確保資料長度足夠
+    if len(df) < 60:
+        # 資料太短，無法計算季線
+        return None, {}, None
+
     try:
-        ticker_clean = str(ticker_input).replace(".TW", "").replace(".TWO", "").strip()
-        
-        # 1. 嘗試上市
-        try_ticker = f"{ticker_clean}.TW"
-        stock = yf.Ticker(try_ticker)
-        df = stock.history(period="2y")
-        
-        # 2. 嘗試上櫃
-        if df.empty:
-            try_ticker = f"{ticker_clean}.TWO"
-            stock = yf.Ticker(try_ticker)
-            df = stock.history(period="2y")
-            
-        if df.empty: return None, {}, None # 真的抓不到
-
-        # 3. 嘗試抓 info (失敗就算了，給空字典)
-        try: info = stock.info
-        except: info = {}
-
         # --- 指標運算 ---
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
         df['Bias'] = ((df['Close'] - df['MA20']) / df['MA20']) * 100
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
         
-        # MVWAP (半年線級別法人成本)
+        # MVWAP
         anchor_window = 120
         df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
         df['TPV'] = df['TP'] * df['Volume']
@@ -100,11 +113,9 @@ def get_stock_data(ticker_input):
         df['Cum_Vol'] = df['Volume'].rolling(window=anchor_window).sum()
         df['MVWAP'] = df['Cum_TPV'] / df['Cum_Vol'].replace(0, np.nan)
         
-        # RVOL
+        # RVOL & OBV
         df['Vol_MA20'] = df['Volume'].rolling(window=20).mean()
         df['RVOL'] = df['Volume'] / df['Vol_MA20'].replace(0, np.nan)
-        
-        # OBV
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
 
@@ -121,8 +132,9 @@ def get_stock_data(ticker_input):
             h, l = df['High'].max(), df['Low'].min()
         df['Price_Pos'] = (df['Close'] - l) / (h - l).replace(0, np.nan)
 
-        return df, info, try_ticker
-    except:
+        return df, info, final_ticker
+    except Exception as e:
+        st.error(f"指標計算錯誤: {e}")
         return None, {}, None
 
 def calculate_seasonality(df):
@@ -164,24 +176,20 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     rsi = curr['RSI']
     price_pos = curr['Price_Pos']
     rvol = curr['RVOL']
-    
     eps = info.get('trailingEps', None)
     mkt_status, vix_val = macro_data
 
     report = {
         "score": 0, "action": "觀望 / 持有", "details": [],
         "atr_stop_price": atr_stop, "trailing_stop_price": 0.0,
-        "price_pos": price_pos, "vwap": mvwap, "market_penalty": False
+        "price_pos": price_pos, "vwap": mvwap
     }
 
-    tech_score = 0
-    chip_score = 0
-    fund_score = 0
+    tech_score, chip_score, fund_score = 0, 0, 0
 
     # 1. 宏觀與基本面
     if mkt_status == "Bear":
         fund_score -= 40
-        report['market_penalty'] = True
         report['details'].append(("[宏觀] ☁️ 大盤空頭", "加權指數跌破季線，建議保守。"))
     
     if eps is not None and eps < 0:
@@ -205,7 +213,6 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     # 2. 技術面
     if close > ma60: tech_score += 20
     else: tech_score -= 30
-    
     if close > ma20: tech_score += 10
     else: tech_score -= 10
 
@@ -222,12 +229,10 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
         tech_score += 10
 
     if rsi > 80: tech_score -= 10
-    
     tech_score = max(-100, min(100, tech_score))
 
     # 3. 籌碼面
     mvwap_slope_up = mvwap > prev['MVWAP']
-    
     if close > mvwap:
         if mvwap_slope_up:
             chip_score += 40
@@ -270,7 +275,7 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
             
             if current_close < report['trailing_stop_price']:
                 final_score = -100
-                report['details'].append(("[紀律] 💰 觸發移動停利", "回檔 10% 獲利了結。"))
+                report['details'].append(("[紀律] 💰 觸發移動停利", "獲利回吐 10%，執行獲利了結。"))
 
     report['score'] = final_score
     if final_score >= 40: report['action'] = "做多/持有"
@@ -280,11 +285,11 @@ def analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode, use_trailin
     return report, tech_score, chip_score, fund_score
 
 # ---------------------------------------------------------
-# 4. 儀表板頁面 (保證輸入框不消失)
+# 4. 儀表板頁面
 # ---------------------------------------------------------
 def dashboard_page():
     st.title("🛡️ Stock Guardian Pro")
-    st.caption("Ver 15.1 (Full Control)")
+    st.caption("Ver 16.0 (強力連線修復版)")
     
     mkt_status, vix_val = get_macro_data()
     if mkt_status == "Bear":
@@ -294,46 +299,19 @@ def dashboard_page():
 
     st.divider()
 
-    # --- 側邊欄 (所有輸入框都放在這裡，保證不消失) ---
+    # --- 側邊欄 (絕對不會消失) ---
     st.sidebar.header("📊 1. 查詢股票")
     ticker_input = st.sidebar.text_input("股票代號", "2408")
     
-    # 為了讓側邊欄的選項在抓不到資料時也能顯示，我們先把 UI 畫出來
-    # 然後再嘗試獲取資料
-    
-    # 嘗試獲取資料
-    df, info, final_ticker = get_stock_data(ticker_input)
-    
-    # 自動偵測 (如果有 info)
-    detected = detect_industry_type(info)
-    # 預設索引：如果有偵測到循環股，預設選 Cycle (index 1)，否則 Trend (index 0)
-    default_idx = 1 if detected else 0
-    
-    # ★★★ 關鍵修復：模式切換按鈕回歸 ★★★
     st.sidebar.markdown("---")
-    st.sidebar.header("⚙️ 2. 策略設定")
-    
-    if detected:
-        st.sidebar.success(f"🔍 AI 偵測：**{detected}** (循環股)")
-    else:
-        st.sidebar.info("🔍 AI 偵測：一般趨勢股")
-        
-    strategy_mode = st.sidebar.radio(
-        "分析模式 (可手動切換)", 
-        ("Trend (趨勢)", "Cycle (循環)"), 
-        index=default_idx,
-        help="Trend：適合台積電、金融股 (破線就跑)\nCycle：適合航運、記憶體 (越跌越買)"
-    )
-    
-    st.sidebar.markdown("---")
-    st.sidebar.header("💰 3. 持倉設定 (選填)")
+    st.sidebar.header("💰 2. 持倉設定 (選填)")
     buy_price = st.sidebar.number_input("買入成本 (未買填0)", value=0.0)
     shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
     stop_loss_pct = st.sidebar.number_input("容忍虧損 %", value=10)
     use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
     
     st.sidebar.markdown("---")
-    st.sidebar.header("📰 4. 外資動向 (選填)")
+    st.sidebar.header("📰 3. 外資動向 (選填)")
     inst_option = st.sidebar.selectbox(
         "外資買賣超？",
         ("🤷‍♂️ 不知道 / 沒看", "🔴 新聞說外資大賣", "🟢 新聞說外資大買")
@@ -345,16 +323,26 @@ def dashboard_page():
     st.sidebar.markdown("---")
     debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
 
-    # --- 主畫面邏輯 ---
+    # --- 主畫面 ---
+    # 嘗試獲取資料
+    df, info, final_ticker = get_stock_data(ticker_input)
+    
     if df is None:
-        st.error(f"❌ 找不到代號 {ticker_input} 的資料。請確認輸入正確 (例如 2330 或 0050)。")
-        return # 只有主畫面停止，側邊欄依然存在
+        st.error(f"❌ 還是抓不到資料 ({ticker_input})。可能原因：1. 代號錯誤 2. Yahoo 伺服器阻擋雲端 IP。")
+        return # 停止渲染圖表，但側邊欄還在
 
-    # 若成功獲取，顯示內容
     st.sidebar.success(f"✅ 已載入：{final_ticker}")
+    detected = detect_industry_type(info)
+    mode_index = 1 if detected else 0
+    
+    if detected: st.sidebar.info(f"🔍 產業：{detected} (循環股)")
+    else: st.sidebar.info("🔍 產業：一般趨勢股")
+    
+    strategy_mode = "Cycle" if detected else "Trend"
 
+    # 執行分析
     report, t_s, c_s, f_s = analyze_logic(
-        df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing, 
+        df, info, buy_price, stop_loss_pct, strategy_mode, use_trailing, 
         (mkt_status, vix_val), manual_score
     )
     
@@ -535,9 +523,8 @@ def instruction_page():
     * **🔴 負分 (< -40)**：看空！
     * **🟠 零分附近**：觀望。
 
-    ### 3. 盤中量能推算 (Ver 13.0 新功能)
-    系統會根據現在幾點，自動推算今天的預估成交量。
-    這解決了早上看盤時，因為累積量太少而誤判「量縮」的問題。
+    ### 3. 盤中量能推算
+    系統會根據現在幾點，自動推算今天的預估成交量，避免早上誤判為無量。
     """)
 
 # ---------------------------------------------------------
