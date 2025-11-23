@@ -6,7 +6,7 @@ import ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
-import time  # 引入時間模組，用來做延遲
+import time
 
 # ---------------------------------------------------------
 # 1. 系統設定與 CSS
@@ -40,6 +40,17 @@ st.markdown("""
         text-decoration: underline dotted;
         cursor: help;
     }
+    
+    /* 說明書標題優化 */
+    .instruction-header {
+        font-size: 1.2rem;
+        font-weight: bold;
+        color: #333;
+        margin-top: 20px;
+        margin-bottom: 10px;
+        border-bottom: 2px solid #eee;
+        padding-bottom: 5px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -51,11 +62,21 @@ def tooltip(text, desc):
 # 2. 資料獲取
 # ---------------------------------------------------------
 @st.cache_data(ttl=900)
-def get_stock_data(ticker):
+def get_stock_data(ticker_input):
     try:
-        stock = yf.Ticker(ticker)
+        ticker_clean = str(ticker_input).replace(".TW", "").replace(".TWO", "").strip()
+        
+        try_ticker = f"{ticker_clean}.TW"
+        stock = yf.Ticker(try_ticker)
         df = stock.history(period="5y")
-        if df.empty: return None, None
+        
+        if df.empty:
+            try_ticker = f"{ticker_clean}.TWO"
+            stock = yf.Ticker(try_ticker)
+            df = stock.history(period="5y")
+            
+        if df.empty: return None, None, None
+
         info = stock.info
 
         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -69,9 +90,9 @@ def get_stock_data(ticker):
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         df['MFI'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
         
-        return df, info
+        return df, info, try_ticker
     except:
-        return None, None
+        return None, None, None
 
 def calculate_seasonality(df):
     try:
@@ -88,12 +109,11 @@ def detect_industry_type(info):
     sector = info.get('sector', '')
     industry = info.get('industry', '')
     summary = info.get('longBusinessSummary', '')
-    
     short_name = info.get('shortName', '')
-    if 'ETF' in short_name or 'Dividend' in short_name:
-        return 'ETF'
+    
+    if 'ETF' in short_name or 'Dividend' in short_name: return 'ETF'
 
-    cycle_keywords = ['Semiconductors', 'Memory', 'DRAM', 'Flash', 'Marine', 'Shipping', 'Freight', 'Transport', 'Steel', 'Iron', 'Metal', 'Chemical', 'Oil', 'Panel', 'Display', 'LCD']
+    cycle_keywords = ['Semiconductors', 'Memory', 'DRAM', 'Flash', 'Marine', 'Shipping', 'Freight', 'Transport', 'Steel', 'Iron', 'Metal', 'Chemical', 'Oil', 'Panel', 'Display', 'LCD', 'Biotechnology', 'Solar']
     
     primary_check = (str(sector) + " " + str(industry)).lower()
     for kw in cycle_keywords:
@@ -196,16 +216,18 @@ def dashboard_page():
     st.divider()
 
     st.sidebar.header("📊 輸入參數")
-    ticker_input = st.sidebar.text_input("股票代號", "2408")
-    ticker = f"{ticker_input}.TW" if not ticker_input.endswith(".TW") else ticker_input
+    ticker_input_raw = st.sidebar.text_input("股票代號", "2408")
     buy_price = st.sidebar.number_input("買入成本", value=60.0)
     shares_held = st.sidebar.number_input("持有股數", value=1000, step=1000)
     stop_loss_pct = st.sidebar.number_input("容忍虧損 %", value=10)
     
-    df, info = get_stock_data(ticker)
+    df, info, final_ticker = get_stock_data(ticker_input_raw)
+    
     if df is None:
-        st.error("查無資料，請檢查代號或網路連線。")
+        st.error(f"找不到代號 {ticker_input_raw} 的資料。")
         return
+
+    st.sidebar.success(f"✅ 成功獲取：{final_ticker}")
 
     detected = detect_industry_type(info)
     mode_index = 1 if detected else 0
@@ -218,7 +240,7 @@ def dashboard_page():
     st.sidebar.markdown("---")
     use_trailing = st.sidebar.checkbox("🚀 啟用移動停利", value=False)
     st.sidebar.markdown("---")
-    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式(驗證數據有沒有抓錯)", value=False)
+    debug_mode = st.sidebar.checkbox("🔧 開發者驗證模式", value=False)
 
     report = analyze_logic(df, info, buy_price, stop_loss_pct, strategy_mode.split()[0], use_trailing)
     
@@ -246,7 +268,7 @@ def dashboard_page():
 
     with st.container():
         st.write("🔎 **進階查詢**")
-        yahoo_link = f"https://tw.stock.yahoo.com/quote/{ticker_input}/institutional-trading"
+        yahoo_link = f"https://tw.stock.yahoo.com/quote/{final_ticker.replace('.TW', '').replace('.TWO', '')}/institutional-trading"
         st.link_button("查看外資買賣超 (Yahoo)", yahoo_link)
 
     st.markdown("---")
@@ -313,7 +335,34 @@ def dashboard_page():
 def scanner_page():
     st.title("🎯 智慧選股雷達")
     st.markdown("### AI 自動掃描 50 檔重要股票")
-    st.info("💡 掃描約需 20~30 秒（已啟用安全禮貌模式，防止 IP 被鎖）。")
+    
+    # ★★★ 新增：評分標準說明 ★★★
+    with st.expander("🕵️‍♂️ AI 是怎麼打分數的？ (點我查看評分標準)"):
+        st.markdown("""
+        AI 像一個嚴格的考官，會檢查以下項目，起點是 **50 分**：
+        
+        1.  **趨勢檢查 (看線型)**：
+            * 跌破月線：+20 分 (扣分)
+            * 跌破季線：+30 分 (扣大分)
+            * 跌破 ATR 安全線：+40 分 (嚴重警告)
+        
+        2.  **籌碼檢查 (看大人)**：
+            * 主力偷賣 (背離)：+20 分 (危險)
+            * 主力偷買 (背離)：-15 分 (變安全，加分)
+        
+        3.  **過熱檢查 (看風險)**：
+            * RSI > 80 或 乖離率過大：+15 分 (太貴了)
+        
+        4.  **價值檢查 (僅限循環股)**：
+            * P/B < 1.0 (便宜)：直接降到 10 分 (超級安全)
+            
+        **最終結果：**
+        * 🟢 **綠燈 (<= 30 分)**：安全，適合買。
+        * 🔴 **紅燈 (>= 80 分)**：危險，不要碰。
+        * 🟠 **橘燈**：普通，再看看。
+        """)
+
+    st.info("💡 掃描約需 60 秒（已啟用安全禮貌模式）。")
     
     watchlist_groups = {
         "🤖 科技權值": {
@@ -349,10 +398,9 @@ def scanner_page():
         
         for i, (category, name, ticker) in enumerate(full_list):
             try:
-                # ★★★ 關鍵：每次請求前休息 0.3 秒，防止被 Yahoo 封鎖 ★★★
-                time.sleep(0.3)
+                time.sleep(0.3) 
+                df, info, final_ticker = get_stock_data(ticker)
                 
-                df, info = get_stock_data(ticker)
                 if df is not None:
                     detected = detect_industry_type(info)
                     mode = "Cycle" if detected or "ETF" in category else "Trend"
@@ -368,7 +416,7 @@ def scanner_page():
                     
                     results.append({
                         "分類": category,
-                        "代號": ticker.replace(".TW", ""),
+                        "代號": ticker.replace(".TW", "").replace(".TWO", ""),
                         "股票": name,
                         "現價": f"{current_price:.1f}",
                         "分數": report['score'],
@@ -399,45 +447,93 @@ def scanner_page():
             st.warning("無法獲取資料，請稍後再試。")
 
 # ---------------------------------------------------------
-# 5. 說明書頁面 (HTML 修復版)
+# 5. 說明書頁面 (完整說明版)
 # ---------------------------------------------------------
 def instruction_page():
     st.title("📖 媽媽的股票操作說明書")
     st.info("💡 提示：下方有藍色底線的文字，滑鼠移上去稍微停一下，就會出現解釋喔！")
     st.divider()
     
-    st.markdown("""
-    <h3>1. 系統是做什麼的？</h3>
-    <p>這套系統就像是您開車時的 
-    <span class='tooltip-text' title='當發生意外時，保護您不要受重傷'>安全氣囊</span> 
-    與 
-    <span class='tooltip-text' title='偵測後方有無障礙物，預防撞擊'>倒車雷達</span>。</p>
-    <ul>
-        <li>它<b>不能</b>保證您買在最低點。</li>
-        <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護辛苦賺的錢。</li>
-    </ul>
-    <hr>
-    <h3>2. 名詞解釋</h3>
-    <ul>
-        <li><span class='tooltip-text' title='就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。'>P/B (股價淨值比)</span>：便宜 vs 貴。</li>
-        <li><span class='tooltip-text' title='主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。'>OBV (能量潮)</span>：主力有沒有在買。</li>
-        <li><span class='tooltip-text' title='電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。'>ATR 安全線</span>：最後防守點。</li>
-        <li><span class='tooltip-text' title='防止賺錢變賠錢。當股價從最高點掉下來 10%，就強制獲利了結。'>移動停利</span>：鎖住獲利的神器。</li>
-    </ul>
-    <hr>
-    <h3>3. 紅綠燈號怎麼看？</h3>
-    """, unsafe_allow_html=True)
+    # 透過 tab 分頁讓說明書更整潔
+    tab1, tab2, tab3, tab4 = st.tabs(["🔰 入門觀念", "📊 指標解釋", "🚦 燈號意義", "🤔 為什麼要用？"])
     
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.error("🛑 紅色：危險")
-        st.markdown("主力在賣、跌破支撐。**請賣出**。")
-    with c2:
-        st.success("✅ 綠色：安全")
-        st.markdown("價值浮現、主力在買。**可佈局**。")
-    with c3:
-        st.warning("⚠️ 橘色：觀望")
-        st.markdown("方向不明確。**多看少做**。")
+    with tab1:
+        st.markdown("""
+        <div class='instruction-header'>這套系統是做什麼的？</div>
+        <p>這套系統就像是您開車時的 
+        <span class='tooltip-text' title='當發生意外時，保護您不要受重傷'>安全氣囊</span> 
+        與 
+        <span class='tooltip-text' title='偵測後方有無障礙物，預防撞擊'>倒車雷達</span>。</p>
+        <ul>
+            <li>它<b>不能</b>保證您買在最低點 (那叫算命)。</li>
+            <li>它<b>可以</b>保證當危險發生時，第一時間叫您跑，保護您的退休金 (這叫保險)。</li>
+        </ul>
+        """, unsafe_allow_html=True)
+
+    with tab2:
+        st.markdown("""
+        <div class='instruction-header'>💰 判斷「貴不貴」(價值)</div>
+        <ul>
+            <li>
+                <span class='tooltip-text' title='就像去百貨公司買衣服。數值 0.8 代表衣服打 8 折，比成本還便宜；數值 2.0 代表賣兩倍價錢，很貴。'>P/B (股價淨值比)</span>：
+                如果是景氣循環股 (如南亞科、長榮)，看到 P/B < 1.0 代表很便宜，可以買。
+            </li>
+            <li>
+                <span class='tooltip-text' title='假設股價都不漲，光靠公司發的利息，每年可以拿多少 %。就像銀行定存利息。'>現金殖利率</span>：
+                如果有 5% 以上，就算被套牢也比較安心。
+            </li>
+        </ul>
+        
+        <div class='instruction-header'>🚀 判斷「會不會漲」(籌碼)</div>
+        <ul>
+            <li>
+                <span class='tooltip-text' title='主力的測謊機。如果股價沒漲，但這條線一直往上爬，代表主力大戶正在偷偷買進。'>OBV (能量潮)</span>：
+                這是最好的進場訊號，代表有人在吃貨。
+            </li>
+            <li>
+                <span class='tooltip-text' title='像溜狗的繩子。如果股價衝太快(乖離太大)，繩子會把狗拉回來，代表漲太多了，不要追高。'>乖離率</span>：
+                如果數值超過 10%，千萬不要買，很容易買在最高點。
+            </li>
+        </ul>
+        
+        <div class='instruction-header'>🛡️ 判斷「什麼時候跑」(防守)</div>
+        <ul>
+            <li>
+                <span class='tooltip-text' title='電腦算出的「最後防線」。如果收盤價跌破這個價格，代表趨勢壞了，一定要跑。'>ATR 安全線</span>：
+                不要心存僥倖，跌破就是賣。
+            </li>
+            <li>
+                <span class='tooltip-text' title='一種鎖住獲利的策略。當股價從最高點掉下來 10%，就強制獲利了結。'>移動停利</span>：
+                這是為了防止「賺 20 萬變賠錢」的慘劇。開啟後，系統會幫您顧好錢包。
+            </li>
+        </ul>
+        """, unsafe_allow_html=True)
+
+    with tab3:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.error("🛑 紅色：危險")
+            st.markdown("主力在賣、跌破支撐。**請賣出或減碼**。")
+        with c2:
+            st.success("✅ 綠色：安全")
+            st.markdown("價值浮現、主力在買。**可以分批買進**。")
+        with c3:
+            st.warning("⚠️ 橘色：觀望")
+            st.markdown("方向不明確。**多看少做**。")
+
+    with tab4:
+        st.markdown("""
+        #### 💡 為什麼 AI 叫我賣，結果賣了就漲？
+        * 這叫**「騙線」**。主力故意假裝賣出，把大家洗出去。
+        * 雖然很氣，但這是**「買保險」**的費用。
+        * 因為如果那次是真的大跌，而您沒賣，可能會賠掉 30%。
+        * 我們寧願**「少賺」**，也不要**「大賠」**。
+        
+        #### 💡 為什麼 AI 叫我買，結果買了就跌？
+        * 股市沒有 100% 準的。
+        * AI 看到的是**「勝率高」**的機會，但不代表**「一定贏」**。
+        * 所以一定要設**停損** (容忍虧損 10%)，錯了就認賠，留得青山在。
+        """)
 
 # ---------------------------------------------------------
 # 6. 主程式
