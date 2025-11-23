@@ -26,50 +26,39 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# 2. 資料獲取層 (回歸最原始、最穩定的邏輯)
+# 2. 資料獲取層 (修正運算錯誤)
 # ---------------------------------------------------------
 @st.cache_data(ttl=300)
 def get_stock_data_robust(ticker_input):
-    """
-    最穩定的抓取邏輯：
-    1. 不做任何預判，直接暴力測試 .TW 和 .TWO
-    2. Info 抓不到就直接忽略，絕不因為 Info 讓程式崩潰
-    """
-    # 清理輸入，只留代號本體 (例如 "2408")
+    # 清理輸入
     ticker_clean = str(ticker_input).strip().upper().replace(".TW", "").replace(".TWO", "")
     
     df = pd.DataFrame()
     final_ticker = ""
     info = {}
 
-    # 定義嘗試清單
+    # 暴力嘗試清單
     try_list = [f"{ticker_clean}.TW", f"{ticker_clean}.TWO", ticker_clean]
 
-    # 迴圈嘗試
     for t in try_list:
         try:
             stock = yf.Ticker(t)
-            temp_df = stock.history(period="2y") # 抓 2 年
-            
-            if not temp_df.empty:
-                df = temp_df
+            # 先抓少量資料確認是否存在
+            temp = stock.history(period="5d")
+            if not temp.empty:
+                # 存在則抓完整資料
+                df = stock.history(period="2y")
                 final_ticker = t
-                
-                # 嘗試抓 Info (這是最常報錯的地方，所以獨立包起來)
-                try:
-                    info = stock.info
-                except:
-                    info = {} # 抓不到就算了，給空字典
-                
-                break # 成功就跳出迴圈
+                try: info = stock.info
+                except: info = {}
+                break
         except:
-            continue # 失敗就試下一個
+            continue
 
-    # 如果試完全部還是空的，回傳 None
     if df.empty:
         return None, {}, None
 
-    # --- 計算指標 (只要有 df 就能算) ---
+    # --- 計算指標 (修正 Numpy/Pandas 衝突) ---
     try:
         # 均線
         df['MA20'] = df['Close'].rolling(window=20).mean()
@@ -87,17 +76,22 @@ def get_stock_data_robust(ticker_input):
         df['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         df['OBV_MA20'] = df['OBV'].rolling(window=20).mean()
 
-        # ATR & 吊燈停損 (Chandelier Exit)
+        # ATR & 吊燈停損
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         df['High_20'] = df['High'].shift(1).rolling(window=20).max()
         df['Chandelier_Exit'] = df['High_20'] - (2.0 * df['ATR'])
         
-        # MVWAP (法人成本)
-        v = df['Volume'].values
-        tp = (df['High'] + df['Low'] + df['Close']) / 3
-        df['MVWAP'] = (tp * v).rolling(window=120).sum() / v.rolling(window=120).sum().replace(0, np.nan)
+        # MVWAP (修正點：確保使用 Series 運算)
+        # 這裡不使用 .values，直接用 Pandas Series 相乘
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        tp_volume = typical_price * df['Volume']
+        
+        cumulative_tp_volume = tp_volume.rolling(window=120).sum()
+        cumulative_volume = df['Volume'].rolling(window=120).sum()
+        
+        df['MVWAP'] = cumulative_tp_volume / cumulative_volume.replace(0, np.nan)
 
-        # 位階 (Price Position)
+        # 位階
         lookback = 500
         if len(df) > lookback:
             h = df['High'].rolling(window=lookback).max()
@@ -105,12 +99,15 @@ def get_stock_data_robust(ticker_input):
         else:
             h = df['High'].max()
             l = df['Low'].min()
-        df['Price_Pos'] = (df['Close'] - l) / (h - l).replace(0, np.nan)
+        
+        denom = h - l
+        # 避免分母為0
+        df['Price_Pos'] = (df['Close'] - l) / denom.replace(0, np.nan)
 
         return df, info, final_ticker
 
     except Exception as e:
-        st.error(f"指標計算錯誤: {e}")
+        st.error(f"指標計算發生內部錯誤: {e}")
         return None, {}, None
 
 @st.cache_data(ttl=1800)
@@ -133,7 +130,10 @@ def get_macro_data():
 def detect_industry_type(info):
     if not info: return None
     check_str = (str(info.get('sector','')) + str(info.get('industry','')) + str(info.get('longBusinessSummary',''))).lower()
-    if 'etf' in info.get('shortName', '').lower(): return 'ETF'
+    short_name = str(info.get('shortName', '')).lower()
+    
+    if 'etf' in short_name or 'dividend' in short_name: return 'ETF'
+    
     keywords = ['semiconductor', 'memory', 'dram', 'marine', 'shipping', 'steel', 'iron', 'panel', 'lcd']
     for k in keywords:
         if k in check_str: return k
@@ -338,6 +338,7 @@ def dashboard_page():
     st.markdown("---")
 
     st.subheader("📋 AI 診斷報告")
+    
     s1, s2, s3 = st.columns(3)
     s1.metric("技術面 (40%)", f"{t_s:.0f}")
     s2.metric("籌碼面 (40%)", f"{c_s:.0f}")
@@ -391,7 +392,7 @@ def dashboard_page():
             st.plotly_chart(fig_season, use_container_width=True)
 
 # ---------------------------------------------------------
-# 5. 智慧選股雷達 (修復：跳過 info 避免報錯)
+# 5. 智慧選股雷達
 # ---------------------------------------------------------
 def scanner_page():
     st.title("🎯 智慧選股雷達")
@@ -405,9 +406,9 @@ def scanner_page():
     st.info("💡 掃描約需 60 秒。")
     
     watchlist_groups = {
-        "🤖 科技權值": {"台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382"},
+        "🤖 科技權值": {"台積電": "2330", "鴻海": "2317", "聯發科": "2454", "廣達": "2382", "台達電": "2308"},
         "💰 金融保險": {"富邦金": "2881", "國泰金": "2882", "中信金": "2891", "兆豐金": "2886"},
-        "🚢 傳產循環": {"長榮": "2603", "陽明": "2609", "中鋼": "2002", "南亞科": "2408"},
+        "🚢 傳產循環": {"長榮": "2603", "陽明": "2609", "中鋼": "2002", "南亞科": "2408", "台塑": "1301"},
         "📦 熱門 ETF": {"0050": "0050", "0056": "0056", "00878": "00878", "00929": "00929"}
     }
     
@@ -422,16 +423,17 @@ def scanner_page():
         
         for i, (category, name, ticker) in enumerate(full_list):
             try:
-                time.sleep(0.1) 
+                # time.sleep(0.1) 
                 df, info, final_ticker = get_stock_data_robust(ticker)
                 if df is not None:
-                    # 簡易分類
-                    mode = "Trend"
-                    if "循環" in category or "南亞科" in name or "長榮" in name: mode = "Cycle"
+                    detected = detect_industry_type(info)
+                    mode = "Cycle" if detected or "ETF" in category else "Trend"
+                    if "ETF" in category: mode = "Trend"
                     
                     current_price = df['Close'].iloc[-1]
+                    # 掃描時手動籌碼設為 0
                     report, _, _, _ = analyze_logic(
-                        df, {}, current_price, 10, mode, False, (mkt_status, 0), 0
+                        df, info, current_price, 10, mode, False, (mkt_status, 0), 0
                     )
                     
                     final_score = report['score']
@@ -468,7 +470,7 @@ def instruction_page():
     st.title("📖 股票操作說明書")
     st.markdown("""
     ### 1. 核心功能
-    * **MVWAP (法人成本)**：這條藍色線模擬法人半年的平均成本。
+    * **MVWAP (法人成本)**：這條藍色線模擬法人半年的平均成本。股價在上面代表法人賺錢，趨勢偏多。
     * **ATR 吊燈防線**：這是紅色的虛線，跌破賣出。
     
     ### 2. 關於分數 (-100 ~ +100)
