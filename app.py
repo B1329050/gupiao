@@ -2,271 +2,213 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import requests
-import warnings
-import urllib3
+import plotly.graph_objects as go
 from datetime import datetime
 
-# === System Config ===
-st.set_page_config(page_title="Stock Guardian AI V3.2 (Integrity Fix)", layout="wide")
-warnings.filterwarnings('ignore')
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# --- 頁面設定 ---
+st.set_page_config(page_title="Stock Guardian AI v3.0", page_icon="🛡️", layout="wide")
 
-# === Global Constants ===
-MA_SHORT = 20
-MA_MID = 60
-
-# === Module: Crawler (SSL & Unit Fix) ===
-class TWSE_Crawler:
-    def __init__(self):
-        self.base_url = "https://www.twse.com.tw/rwd/zh/fund/T86"
-    
-    def fetch_real_chips(self, stock_id):
-        try:
-            date_str = datetime.now().strftime('%Y%m%d')
-            params = {'date': date_str, 'selectType': 'ALL', 'response': 'json'}
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            res = requests.get(self.base_url, params=params, headers=headers, timeout=5, verify=False)
-            
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('stat') == 'OK':
-                    for row in data.get('data', []):
-                        if row[0] == stock_id:
-                            # 單位修正：股 -> 張
-                            f_net = int(row[4].replace(',', '')) // 1000
-                            t_net = int(row[10].replace(',', '')) // 1000
-                            return {'status': True, 'foreign': f_net, 'trust': t_net}
-            return {'status': False, 'msg': 'No Data'}
-        except Exception as e:
-            return {'status': False, 'msg': str(e)}
-
-# === Core Engine (V3.2 Fixes) ===
-class StockGuardianV3_2:
-    def __init__(self, stock_id):
-        self.stock_id = stock_id
-        self.ticker_id = f"{stock_id}.TW"
-        self.crawler = TWSE_Crawler()
-        
-        self.df = None
-        self.q_financials = None
-        self.real_chips = None
-        self.macro = {}
-        
-        self.scores = {'fund': 0, 'tech': 0, 'chips': 0}
-        self.logs = {'fund': [], 'tech': [], 'chips': [], 'debug': []}
-        
-        # Flags
-        self.data_is_stale = False # 財報是否過期
-        self.is_turnaround = False
-        self.advice = {}
+# --- 核心分析類別 (修改為適配 Streamlit) ---
+class StockAnalystAI:
+    def __init__(self, ticker):
+        self.ticker_symbol = f"{ticker}.TW" if not ticker.endswith('.TW') and not ticker.isdigit() == False else f"{ticker}.TW"
+        # 簡單處理輸入，若輸入 2408 自動變 2408.TW
+        if ticker.isdigit():
+             self.ticker_symbol = f"{ticker}.TW"
+        else:
+             self.ticker_symbol = ticker
 
     def fetch_data(self):
-        with st.spinner("Fetching Clean Data (Auto-Adjusted)..."):
-            ticker = yf.Ticker(self.ticker_id)
-            
-            # FIX 1: Auto Adjust = True (還原權息，修復 MA 斷層)
-            # Fetch 2 years to ensure MA60 has full window
-            self.df = ticker.history(period="2y", auto_adjust=True)
-            
-            # Data Cleaning: Remove Rows with 0 or NaN
-            self.df = self.df[self.df['Close'] > 0].dropna()
-            
-            if len(self.df) < 60:
-                st.error("❌ Data Error: Insufficient history for MA60.")
-                st.stop()
-
-            # FIX 2: Check Financials Date
-            qf = ticker.quarterly_financials
-            if qf is not None:
-                self.q_financials = qf[sorted(qf.columns, reverse=True)]
-            
-            # Chips
-            if '.TW' in self.ticker_id:
-                self.real_chips = self.crawler.fetch_real_chips(self.stock_id)
-            
-            # Macro
-            try:
-                self.macro['VIX'] = yf.Ticker("^VIX").history(period="5d")['Close'].iloc[-1]
-            except: self.macro['VIX'] = 20.0
-
-    # === Fundamental: Fallback Logic ===
-    def analyze_fundamental(self):
-        score = 0
-        logs = []
-        
+        """抓取歷史數據"""
         try:
-            # Check Freshness
-            latest_date = self.q_financials.columns[0]
-            days_diff = (datetime.now() - latest_date).days
-            logs.append(f"📅 Report Date: {latest_date.date()} ({days_diff} days ago)")
-            
-            # FIX 3: Stale Data Logic
-            if days_diff > 120: # 若超過 4 個月沒更新
-                self.data_is_stale = True
-                logs.append(f"⚠️ **Data Stale (>120d)**: Skipping Fundamental Weight.")
-                logs.append(f"ℹ️ System will rely on Tech + Chips.")
-                self.scores['fund'] = 0 # Score set to 0 but will be excluded from weight
-            else:
-                # Normal Logic
-                eps_curr = self.q_financials.loc['Basic EPS'].iloc[0]
-                eps_prev = self.q_financials.loc['Basic EPS'].iloc[1]
-                
-                if eps_prev < 0 and eps_curr > 0:
-                    self.is_turnaround = True
-                    score = 4.0
-                    logs.append(f"🚀 **Turnaround**: EPS {eps_prev} -> {eps_curr}")
-                else:
-                    if eps_curr > eps_prev: score += 1
-                    roe = 0 
-                    if roe > 0.15: score += 1
-                    # Simple checks for demo
-                    pe = 20 # Mock
-                    if pe < 15: score += 1
+            stock = yf.Ticker(self.ticker_symbol)
+            df = stock.history(period="1y")
+            if df.empty:
+                st.error(f"❌ 找不到股票代號: {self.ticker_symbol}，請確認輸入正確。")
+                return None
+            return df
         except Exception as e:
-            logs.append(f"⚠️ Fund Error: {e}")
-        
-        if not self.data_is_stale:
-            self.scores['fund'] = min(4.0, score)
-        self.logs['fund'] = logs
+            st.error(f"連線錯誤: {e}")
+            return None
 
-    # === Technical: Ghost Data Fix ===
-    def analyze_technical(self):
+    def calculate_technicals(self, df):
+        """計算技術指標"""
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA60'] = df['Close'].rolling(window=60).mean()
+        
+        # 乖離率計算
+        df['Bias_60'] = (df['Close'] - df['MA60']) / df['MA60'] * 100
+        
+        # RSI 計算
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        return df
+
+    def run_analysis(self, df, eps_status, gm_status, chips_vol):
+        """執行評分邏輯"""
+        data = df.iloc[-1] # 最新一筆
+        price = data['Close']
+        ma60 = data['MA60']
+        bias_60 = data['Bias_60']
+        rsi = data['RSI']
+        
         score = 0
-        logs = []
+        report_logs = []
         
-        close = self.df['Close']
-        curr_price = close.iloc[-1]
+        # --- 1. 基本面 (40%) ---
+        fund_score = 0
+        if eps_status == 'Turnaround (轉虧為盈)':
+            fund_score += 2.0
+            report_logs.append("✅ [基本面] EPS 轉虧為盈 (強烈買進訊號)")
+        elif eps_status == 'Growth (成長)':
+            fund_score += 1.5
+            report_logs.append("✅ [基本面] EPS 持續成長")
         
-        # FIX 4: Robust MA Calculation
-        # min_periods=1 ensures we get a number, but we filtered data already
-        ma20 = close.rolling(20).mean().iloc[-1]
-        ma60 = close.rolling(60).mean().iloc[-1]
-        
-        # Bias
-        bias = ((curr_price - ma60) / ma60) * 100
-        
-        logs.append(f"📏 Price: {curr_price:.1f} | MA60: {ma60:.1f} | Bias: {bias:.2f}%")
-        
-        # Scoring
-        # 1. Bias (Oversold is Good)
-        if bias < -5:
-            score += 1.0
-            logs.append(f"✅ **Oversold**: Bias {bias:.1f}% (Negative)")
-        elif bias > 20:
-            logs.append(f"🔻 Overheated: Bias +{bias:.1f}%")
-            
-        # 2. RSI
-        delta = close.diff()
-        gain = (delta.where(delta>0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta<0, 0)).rolling(14).mean()
-        rs = gain/loss
-        rsi = 100 - (100/(1+rs)).iloc[-1]
-        
-        if rsi < 35: 
-            score += 1.0
-            logs.append(f"✅ RSI Bottom: {rsi:.1f}")
-        
-        # 3. Structure
-        if curr_price > ma60:
-            score += 1.0
-            logs.append("✅ Uptrend (Price > MA60)")
-        elif self.is_turnaround or self.data_is_stale:
-            # 若是資料過期(通常是循環股)或轉機股，容許跌破均線
-            score += 0.5 
-            logs.append("ℹ️ Downtrend Tolerance (Cyclical/Turnaround)")
-
-        self.scores['tech'] = min(3.0, score)
-        self.logs['tech'] = logs
-
-    # === Chips ===
-    def analyze_chips(self):
-        score = 0
-        logs = []
-        
-        if self.real_chips and self.real_chips['status']:
-            net = self.real_chips['foreign'] + self.real_chips['trust']
-            logs.append(f"🏦 Net Buy: {net} 張")
-            if net > 0:
-                score += 2.0
-                logs.append("🔥 **Smart Money**: Buying")
-        
-        vol = self.df['Close'].pct_change().std() * np.sqrt(252)
-        if vol < 0.4:
-            score += 1.0
-            logs.append(f"✅ Stable: Vol {vol:.2f}")
-            
-        self.scores['chips'] = min(3.0, score)
-        self.logs['chips'] = logs
-
-    def run(self):
-        self.fetch_data()
-        self.analyze_fundamental()
-        self.analyze_technical()
-        self.analyze_chips()
-        
-        # FIX 5: Dynamic Weighting (Fallback Logic)
-        if self.data_is_stale:
-            # 忽略基本面，將滿分基數從 10 分降為 6 分，再換算回 10 分制
-            raw_score = self.scores['tech'] + self.scores['chips']
-            max_potential = 6.0 # Tech(3) + Chips(3)
-            final_score = (raw_score / max_potential) * 10
-            self.logs['debug'].append("⚠️ Fundamental Weight Ignored (Stale Data)")
+        if gm_status == 'Up (上升)':
+            fund_score += 2.0
+            report_logs.append("✅ [基本面] 毛利率回升 (護城河變寬)")
         else:
-            raw_score = self.scores['fund'] + self.scores['tech'] + self.scores['chips']
-            final_score = raw_score # / 10
+            report_logs.append("🔻 [基本面] 毛利率下滑 (扣分)")
             
-        # Macro Penalty
-        if self.macro['VIX'] > 30: final_score *= 0.8
+        score += fund_score
         
-        return final_score
+        # --- 2. 技術面 (30%) ---
+        tech_score = 0
+        
+        # 乖離率邏輯
+        if bias_60 < -10:
+            tech_score += 1.5
+            report_logs.append(f"✅ [技術面] 負乖離過大 ({bias_60:.2f}%)，超賣有反彈空間")
+        elif abs(bias_60) < 5:
+            tech_score += 1.0
+            report_logs.append(f"ℹ️ [技術面] 股價貼近季線 ({bias_60:.2f}%)，方向待變")
+        elif bias_60 > 20:
+            tech_score -= 1.0
+            report_logs.append(f"⚠️ [技術面] 正乖離過大 ({bias_60:.2f}%)，過熱警告")
+        else:
+            if price > ma60:
+                tech_score += 0.5
+                report_logs.append("✅ [技術面] 股價位於季線上方 (多頭)")
+            else:
+                report_logs.append("🔻 [技術面] 股價位於季線下方 (整理)")
 
-# === UI ===
-st.title("🛡️ Stock Guardian V3.2 (Integrity Fix)")
-st.caption("Auto-Adjusted Data | Stale Data Fallback | Correct MA Logic")
+        # RSI
+        if rsi < 30:
+            tech_score += 1.0
+            report_logs.append(f"✅ [技術面] RSI ({rsi:.1f}) 超賣區 (底部訊號)")
+        elif rsi > 70:
+            report_logs.append(f"⚠️ [技術面] RSI ({rsi:.1f}) 超買區 (追高風險)")
+            
+        score += tech_score
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    s_input = st.text_input("Ticker", "2408")
-with col2:
-    st.write("")
-    st.write("")
-    btn = st.button("Analyze", type="primary")
+        # --- 3. 籌碼面 (30%) ---
+        chip_score = 0
+        formatted_vol = f"{int(chips_vol):,}"
+        
+        if chips_vol > 5000:
+            chip_score += 3.0
+            report_logs.append(f"🔥 [籌碼面] 主力大舉買超 (+{formatted_vol} 張)")
+        elif chips_vol > 0:
+            chip_score += 1.5
+            report_logs.append(f"✅ [籌碼面] 法人小幅吸籌 (+{formatted_vol} 張)")
+        else:
+            report_logs.append(f"🔻 [籌碼面] 法人賣超 ({formatted_vol} 張)")
+            
+        # 壓低吃貨偵測
+        prev_close = df.iloc[-2]['Close']
+        if price < prev_close and chips_vol > 0:
+             report_logs.append("✨ [籌碼面] 偵測到「壓低吃貨」行為 (價跌量增+法人買)")
+             chip_score += 0.5 # 加分
+             
+        score += chip_score
+        
+        return score, report_logs, data
 
-if btn:
-    engine = StockGuardianV3_2(s_input)
-    score = engine.run()
-    
-    st.markdown("---")
-    
-    # Metrics
-    c1, c2, c3, c4 = st.columns(4)
-    
-    # 顯示分數 (若 Stale 則顯示 N/A)
-    f_disp = "N/A (Stale)" if engine.data_is_stale else f"{engine.scores['fund']} / 4.0"
-    c1.metric("Fundamental", f_disp)
-    c2.metric("Technical", f"{engine.scores['tech']} / 3.0")
-    c3.metric("Chips", f"{engine.scores['chips']} / 3.0")
-    
-    color = "normal"
-    if score >= 7: color = "normal"
-    elif score < 5: color = "inverse"
-    
-    c4.metric("🏆 Final Score", f"{score:.2f} / 10", 
-              delta="Strong Buy" if score>=7 else "Hold", 
-              delta_color=color)
-    
-    if engine.data_is_stale:
-        st.warning("⚠️ **Data Latency Mode**: Financial reports are outdated. Score is based purely on **Technicals & Chips**.")
+# --- UI 介面 ---
+st.title("🛡️ Stock Guardian AI v3.0 (Analyst Edition)")
+st.markdown("### 全方位即時股票分析系統 (yfinance + 手動校正)")
 
-    # Details
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.info("Fundamental")
-        for l in engine.logs['fund']: st.write(l)
-    with c2:
-        st.success("Technical")
-        for l in engine.logs['tech']: st.write(l)
-    with c3:
-        st.warning("Chips")
-        for l in engine.logs['chips']: st.write(l)
+# 側邊欄：輸入區
+with st.sidebar:
+    st.header("1. 股票設定")
+    ticker_input = st.text_input("輸入台股代號", value="2408")
+    
+    st.header("2. 手動注入 (Manual Injection)")
+    st.info("解決 API 財報滯後問題，請手動輸入最新狀況")
+    
+    eps_opt = st.selectbox("EPS 狀態 (最新一季)", 
+                           ['Turnaround (轉虧為盈)', 'Growth (成長)', 'Decline (衰退)'])
+    
+    gm_opt = st.radio("毛利率趨勢", ['Up (上升)', 'Down (下降)'])
+    
+    chips_input = st.number_input("今日法人買賣超 (張)", value=0, step=100, help="正數為買超，負數為賣超")
+    
+    run_btn = st.button("🚀 啟動高階分析", type="primary")
+
+# 主畫面邏輯
+if run_btn:
+    bot = StockAnalystAI(ticker_input)
+    
+    with st.spinner(f"正在連線全球節點抓取 {ticker_input} 最新數據..."):
+        raw_df = bot.fetch_data()
+    
+    if raw_df is not None:
+        # 計算指標
+        df_processed = bot.calculate_technicals(raw_df)
+        
+        # 執行分析
+        final_score, logs, latest_data = bot.run_analysis(
+            df_processed, eps_opt, gm_opt, chips_input
+        )
+        
+        # --- 顯示結果區域 ---
+        
+        # 1. 關鍵指標卡 (Metrics)
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("最新收盤價", f"{latest_data['Close']:.1f}")
+        col2.metric("季線 (MA60)", f"{latest_data['MA60']:.1f}")
+        col3.metric("乖離率 (Bias)", f"{latest_data['Bias_60']:.2f}%", 
+                    delta_color="inverse") # 乖離率越小越好(綠色)
+        col4.metric("RSI 強弱", f"{latest_data['RSI']:.1f}")
+        
+        # 2. 評分結果
+        st.divider()
+        st.subheader("🏆 最終評分與建議")
+        
+        score_col, advice_col = st.columns([1, 2])
+        
+        with score_col:
+            st.metric("綜合得分", f"{final_score:.1f} / 10.0")
+        
+        with advice_col:
+            if final_score >= 7.5:
+                st.success("### ⭐ STRONG BUY (強力買進)\n基本面好轉 + 技術面配合 + 籌碼進駐")
+            elif final_score >= 5.0:
+                st.warning("### ⚖️ HOLD / ACCUMULATE (分批承接)\n關注轉機，適合區間操作")
+            else:
+                st.error("### 🛑 SELL / WAIT (觀望/賣出)\n數據疲弱，建議避開")
+
+        # 3. 詳細分析日誌
+        with st.expander("查看詳細分析邏輯 (Logic Logs)", expanded=True):
+            for log in logs:
+                st.write(log)
+
+        # 4. 互動圖表 (證明 MA60 是對的)
+        st.divider()
+        st.subheader("📈 趨勢驗證圖表")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_processed.index, y=df_processed['Close'], 
+                                 mode='lines', name='收盤價'))
+        fig.add_trace(go.Scatter(x=df_processed.index, y=df_processed['MA60'], 
+                                 mode='lines', name='季線 (60MA)', line=dict(color='orange')))
+        
+        fig.update_layout(title=f"{ticker_input} 股價 vs 季線", xaxis_title="日期", yaxis_title="價格")
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        st.warning("無法取得數據，請稍後再試。")
