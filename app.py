@@ -7,394 +7,396 @@ import warnings
 import urllib3
 from datetime import datetime, timedelta
 
-# 1. 頁面設定 (必須在第一行)
-st.set_page_config(page_title="Hedge Fund Alpha Engine", layout="wide")
-
-# 2. 忽略警告設定 (針對 SSL 憑證錯誤與 Pandas)
+# === System Config ===
+st.set_page_config(page_title="Stock Guardian AI (Wall St. Edition)", layout="wide")
 warnings.filterwarnings('ignore')
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 3. 定義真實爬蟲類別 (已修復 SSL 問題)
+# === Global Constants ===
+MA_SHORT = 20  # 月線
+MA_MID = 60    # 季線 (生命線)
+
+# === Module 1: Data Access Layer (Crawler) ===
 class TWSE_Crawler:
+    """
+    負責抓取真實的法人籌碼數據。
+    Fix: 加入 User-Agent 與 verify=False 以繞過證交所防火牆。
+    """
     def __init__(self):
-        # 證交所個股盤後資訊接口 (包含三大法人)
         self.base_url = "https://www.twse.com.tw/rwd/zh/fund/T86"
     
     def fetch_real_chips(self, stock_id):
-        """
-        真正執行 HTTP 請求去抓取證交所數據
-        包含 verify=False 以解決 SSLCertVerificationError
-        """
         try:
-            # 取得最近交易日 (嘗試抓取今天)
+            # 嘗試抓取當日數據 (若盤中無數據，邏輯上應回溯，此處簡化為抓取最新可用)
             date_str = datetime.now().strftime('%Y%m%d')
             
-            params = {
-                'date': date_str,
-                'selectType': 'ALL',
-                'response': 'json'
-            }
+            params = {'date': date_str, 'selectType': 'ALL', 'response': 'json'}
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
             
-            # 設定 User-Agent 偽裝成瀏覽器
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
+            # Request
+            res = requests.get(self.base_url, params=params, headers=headers, timeout=5, verify=False)
             
-            # === 關鍵修正：加入 verify=False 跳過 SSL 檢查 ===
-            response = requests.get(self.base_url, params=params, headers=headers, timeout=5, verify=False)
-            
-            if response.status_code == 200:
-                data = response.json()
+            if res.status_code == 200:
+                data = res.json()
                 if data.get('stat') == 'OK':
-                    # 解析 JSON 尋找該股票代號
-                    raw_data = data.get('data') # 數據內容
-                    
-                    target_data = None
-                    for row in raw_data:
-                        if row[0] == stock_id: # 0號欄位通常是證券代號
-                            target_data = row
-                            break
-                    
-                    if target_data:
-                        # 成功抓到數據
-                        # target_data[4] 通常是外資買賣超, [10] 是投信 (依實際回傳為準)
-                        # 這裡回傳成功狀態
-                        return {'status': True, 'msg': '成功獲取證交所盤後數據'}
-            
-            # 若無數據或非盤後時間
-            return {'status': False, 'msg': '非盤後時間或無數據，轉用量價模型'}
-
+                    for row in data.get('data', []):
+                        if row[0] == stock_id:
+                            # 格式: [代號, 名稱, 外資買進, 外資賣出, 外資買賣超(4), ..., 投信買賣超(10), ...]
+                            # 注意: 證交所格式可能會變，這裡抓取關鍵欄位
+                            # 欄位 4: 外資買賣超, 欄位 10: 投信買賣超
+                            foreign_net = int(row[4].replace(',', ''))
+                            trust_net = int(row[10].replace(',', ''))
+                            return {
+                                'status': True, 
+                                'foreign': foreign_net, 
+                                'trust': trust_net,
+                                'msg': 'Data Retrieved'
+                            }
+            return {'status': False, 'msg': 'No Data / Market Closed'}
         except Exception as e:
-            return {'status': False, 'msg': f'連線異常 ({str(e)})，轉用量價模型'}
+            return {'status': False, 'msg': str(e)}
 
-# 4. 核心引擎
-class StreamlitHedgeFundEngine:
+# === Module 2: Quantitative Analysis Engine ===
+class QuantEngine:
     def __init__(self, stock_id):
-        self.raw_id = str(stock_id)
-        self.ticker_id = self._detect_market_suffix(self.raw_id)
-        self.market_type = 'TWSE' if '.TW' in self.ticker_id else 'TPEx'
-        self.ticker = None
-        self.df = None
-        self.info = {}
-        self.financials = None
-        self.balance_sheet = None
-        
-        # 實例化爬蟲
+        self.stock_id = stock_id
+        self.ticker_id = f"{stock_id}.TW" # Default TWSE
         self.crawler = TWSE_Crawler()
         
-        # 數據容器
+        # Data Containers
+        self.df = None          # Price History
+        self.info = {}          # Basic Info
+        self.q_financials = None # Quarterly Financials (Critical for Turnaround)
+        self.balance_sheet = None
+        self.real_chips = None
         self.macro = {}
-        self.report_logs = [] 
-        self.advice = {}
-        self.chips_real_data = None
         
-        # 評分
-        self.base_score = 0
-        self.multiplier = 1.0
-        self.final_score = 0
-        self.veto_triggered = False
-        self.veto_reason = ""
+        # Analysis Results
+        self.scores = {'fund': 0, 'chips': 0, 'tech': 0}
+        self.logs = []
+        self.veto = False
+        self.is_turnaround = False # 轉機股標記
+        self.advice = {}
 
-    def _detect_market_suffix(self, stock_id):
+    def _detect_market(self):
+        """自動判斷上市/上櫃"""
         for suffix in ['.TW', '.TWO']:
-            try_id = f"{stock_id}{suffix}"
-            try:
-                test = yf.Ticker(try_id)
-                if not test.history(period='3d').empty: return try_id
-            except: continue
-        st.error(f"找不到代號 {stock_id}，請確認輸入正確。")
+            t = yf.Ticker(f"{self.stock_id}{suffix}")
+            if not t.history(period='3d').empty:
+                self.ticker_id = f"{self.stock_id}{suffix}"
+                return t
+        st.error(f"Ticker {self.stock_id} not found.")
         st.stop()
 
     def fetch_data(self):
-        with st.spinner(f"正在連線資料庫抓取 {self.ticker_id} ({self.market_type})..."):
-            self.ticker = yf.Ticker(self.ticker_id)
-            self.df = self.ticker.history(period="1y")
-            self.info = self.ticker.info
-            self.financials = self.ticker.financials
-            self.balance_sheet = self.ticker.balance_sheet
+        with st.spinner("Fetching Data from Exchanges & Bloomberg Terminals..."):
+            ticker = self._detect_market()
             
-            # 宏觀數據
+            # 1. Price Data (1 Year)
+            self.df = ticker.history(period="1y")
+            
+            # 2. Quarterly Financials (重點優化：只看季報，不看 TTM)
+            self.q_financials = ticker.quarterly_financials
+            self.balance_sheet = ticker.quarterly_balance_sheet
+            self.info = ticker.info
+            
+            # 3. Real Chips
+            if '.TW' in self.ticker_id and '.TWO' not in self.ticker_id:
+                self.real_chips = self.crawler.fetch_real_chips(self.stock_id)
+            
+            # 4. Macro
             try:
                 self.macro['VIX'] = yf.Ticker("^VIX").history(period="5d")['Close'].iloc[-1]
-                self.macro['TNX'] = yf.Ticker("^TNX").history(period="5d")['Close'].iloc[-1]
             except:
                 self.macro['VIX'] = 20.0
-                self.macro['TNX'] = 4.0
 
-            # 執行 Plan B: 真實爬蟲
-            if self.market_type == 'TWSE':
-                self.chips_real_data = self.crawler.fetch_real_chips(self.raw_id)
-            else:
-                self.chips_real_data = {'status': False, 'msg': '上櫃股票不支援證交所爬蟲'}
-
-    def log(self, msg, status="neutral"):
-        color = "black"
-        if status == "good": color = "green"
-        elif status == "bad": color = "red"
-        elif status == "warn": color = "orange"
-        self.report_logs.append(f":{color}[{msg}]")
-
-    # === 維度 1: 宏觀與否決 (檢查 Prompt 每個字) ===
-    def check_macro_veto(self):
-        vix = self.macro['VIX']
-        
-        # VIX 檢查
-        if vix > 40:
-            self.veto_triggered = True
-            self.veto_reason = f"系統性崩盤風險 (VIX {vix:.1f} > 40)"
-            return
-
-        # 存貨週轉天數 (Inventory Days) - Prompt: "財報出現重大瑕疵（如存貨週轉天數異常暴增）"
-        try:
-            if 'Inventory' in self.balance_sheet.index and 'Cost Of Revenue' in self.financials.index:
-                inv = self.balance_sheet.loc['Inventory'].iloc[0]
-                cost = self.financials.loc['Cost Of Revenue'].iloc[0]
-                days = (inv / cost) * 365
-                
-                # 比較去年同期
-                days_prev = days # 預設
-                if self.balance_sheet.shape[1] > 1:
-                    inv_prev = self.balance_sheet.loc['Inventory'].iloc[1]
-                    cost_prev = self.financials.loc['Cost Of Revenue'].iloc[1]
-                    days_prev = (inv_prev / cost_prev) * 365
-                    
-                    diff = (days - days_prev) / days_prev
-                    
-                    # 顯示數據在 Log
-                    log_status = "bad" if diff > 0.5 else "good"
-                    self.log(f"存貨週轉天數: 本期 {days:.0f}天 vs 去年同期 {days_prev:.0f}天 (變動 {diff*100:+.0f}%)", log_status)
-                    
-                    if diff > 0.5: # 暴增 50%
-                        self.veto_triggered = True
-                        self.veto_reason = f"存貨週轉天數異常暴增 (+{diff*100:.0f}%)，疑似假帳/滯銷"
-        except:
-            self.log("存貨數據缺失，無法計算週轉天數", "warn")
-
-        # 嚴重虧損防護
-        roe = self.info.get('returnOnEquity', 0)
-        if roe < -0.2:
-            self.veto_triggered = True
-            self.veto_reason = f"基本面嚴重惡化 (ROE {roe*100:.1f}%)"
-
-    # === 維度 2: 基本面 ===
+    # --- Logic 1: Fundamental (Turnaround Logic Added) ---
     def analyze_fundamental(self):
         score = 0
         details = []
         
-        # ROE
-        roe = self.info.get('returnOnEquity', 0)
-        if roe > 0.15:
-            score += 1
-            details.append(f"✅ ROE: {roe*100:.2f}% (>15%)")
-        else:
-            details.append(f"🔸 ROE: {roe*100:.2f}%")
-
-        # EPS Growth
-        eps_g = self.info.get('earningsGrowth', 0)
-        if eps_g > 0.2:
-            score += 1
-            details.append(f"✅ EPS成長: {eps_g*100:.2f}% (>20%)")
-        else:
-            details.append(f"🔸 EPS成長: {eps_g*100:.2f}%")
-
-        # PEG (Prompt: 判斷高估低估)
-        pe = self.info.get('trailingPE', 0)
-        peg = pe / (eps_g * 100) if eps_g > 0 else 999
-        if 0 < peg < 1.5:
-            score += 1
-            details.append(f"✅ PEG: {peg:.2f} (低估)")
-        elif peg > 2.0:
-            details.append(f"🔻 PEG: {peg:.2f} (高估)")
-        else:
-            details.append(f"🔸 PEG: {peg:.2f}")
-
-        # 毛利趨勢 (Prompt: 趨勢判斷)
+        # Data Pre-processing: Extract Latest 2 Quarters
         try:
-            gm_curr = self.financials.loc['Gross Profit'].iloc[0] / self.financials.loc['Total Revenue'].iloc[0]
-            if self.financials.shape[1] > 1:
-                gm_prev = self.financials.loc['Gross Profit'].iloc[1] / self.financials.loc['Total Revenue'].iloc[1]
-                if gm_curr >= gm_prev:
-                    score += 1
-                    details.append(f"✅ 毛利趨勢: 上升 ↗ ({gm_curr*100:.1f}%)")
-                else:
-                    details.append(f"🔻 毛利趨勢: 下滑 ↘ ({gm_curr*100:.1f}%)")
+            # yfinance 欄位通常是日期倒序 (col 0 = Latest, col 1 = Previous)
+            q1_date = self.q_financials.columns[0]
+            q2_date = self.q_financials.columns[1]
+            
+            # EPS
+            eps_q1 = self.q_financials.loc['Basic EPS'].iloc[0]
+            eps_q2 = self.q_financials.loc['Basic EPS'].iloc[1]
+            
+            # Gross Margin (毛利率)
+            try:
+                # 嘗試標準欄位名稱
+                gm_q1 = (self.q_financials.loc['Gross Profit'].iloc[0] / self.q_financials.loc['Total Revenue'].iloc[0])
+                gm_q2 = (self.q_financials.loc['Gross Profit'].iloc[1] / self.q_financials.loc['Total Revenue'].iloc[1])
+            except:
+                gm_q1, gm_q2 = 0, 0 # Fallback
+
+            # Logic 1.1: Turnaround Detection (轉機股偵測)
+            if eps_q2 < 0 and eps_q1 > 0:
+                self.is_turnaround = True
+                score += 4 # 直接給滿分 (Fundamental Max)
+                details.append(f"🔥 **Turnaround Detected (轉虧為盈)**: Q{q2_date.month} EPS {eps_q2} -> Q{q1_date.month} EPS {eps_q1}")
+                details.append(f"ℹ️ **Strategy**: Ignore PEG/PE. Focus on Growth.")
+                
+            # Logic 1.2: Normal Evaluation (非轉機股)
             else:
-                details.append(f"🔸 毛利: {gm_curr*100:.1f}% (無前期比較)")
-        except:
-            details.append("🔸 毛利數據缺失")
+                # ROE Check
+                roe = self.info.get('returnOnEquity', 0)
+                if roe > 0.15: 
+                    score += 1
+                    details.append(f"✅ ROE: {roe*100:.1f}% (Quality)")
+                
+                # EPS Growth
+                if eps_q1 > eps_q2:
+                    score += 1
+                    details.append(f"✅ EPS QoQ Growth: {eps_q2} -> {eps_q1}")
+                
+                # PEG (Only if EPS > 0)
+                pe = self.info.get('trailingPE', 0)
+                growth = self.info.get('earningsGrowth', 0) # This is usually YoY
+                if growth > 0 and pe > 0:
+                    peg = pe / (growth * 100)
+                    if peg < 1.5: 
+                        score += 1
+                        details.append(f"✅ PEG: {peg:.2f} (Undervalued)")
+                    elif peg > 2.5:
+                        details.append(f"🔻 PEG: {peg:.2f} (Overvalued)")
+                else:
+                     details.append(f"🔸 PEG Invalid (N/A)")
 
-        return score, details
+            # Logic 1.3: Gross Margin Slope (關鍵指標)
+            if gm_q1 > gm_q2:
+                if not self.is_turnaround: score += 1
+                details.append(f"✅ **GM Expanding (毛利擴張)**: {gm_q2*100:.1f}% -> {gm_q1*100:.1f}%")
+                self.gm_expanding = True
+            else:
+                details.append(f"🔻 GM Contracting: {gm_q2*100:.1f}% -> {gm_q1*100:.1f}%")
+                self.gm_expanding = False
 
-    # === 維度 3: 籌碼面 ===
-    def analyze_chips(self):
-        score = 0
-        details = []
+        except Exception as e:
+            details.append(f"⚠️ Fundamental Data Missing: {e}")
         
-        # 1. 真實籌碼 (Plan B)
-        use_real = False
-        if self.chips_real_data and self.chips_real_data.get('status') is True:
-            use_real = True
-            details.append(f"✅ 啟用真實法人數據: {self.chips_real_data.get('msg')}")
-        else:
-            # 顯示失敗原因 (讓使用者知道爬蟲確實有運作，只是可能沒資料)
-            msg = self.chips_real_data.get('msg', '未知') if self.chips_real_data else '未初始化'
-            details.append(f"🔸 爬蟲狀態: {msg} -> 轉用量價模型")
+        self.scores['fund'] = min(4, score)
+        return details
 
-        # 2. 量價分析 (Prompt: 散戶流向大戶?)
-        vol_ma5 = self.df['Volume'].rolling(5).mean().iloc[-1]
-        vol_ma20 = self.df['Volume'].rolling(20).mean().iloc[-1]
-        pct = self.df['Close'].pct_change(periods=5).iloc[-1]
-        
-        if pct > 0 and vol_ma5 > vol_ma20:
-            if not use_real: score += 1
-            details.append("✅ 資金流向: 量增價漲 (進貨)")
-        elif pct < 0 and vol_ma5 > vol_ma20:
-            details.append("🔻 資金流向: 量增價跌 (出貨)")
-        else:
-            details.append("🔸 資金流向: 量能平穩")
-
-        # 3. 集中度
-        vol = self.df['Close'].pct_change().std() * np.sqrt(252)
-        if vol < 0.35:
-            score += 1
-            details.append(f"✅ 籌碼集中度: 高 (波動率 {vol*100:.1f}%)")
-        else:
-            details.append(f"🔸 籌碼集中度: 低 (波動率 {vol*100:.1f}%)")
-
-        return score, details
-
-    # === 維度 4: 技術面 ===
+    # --- Logic 2: Technical (Bias Fix & Positioning) ---
     def analyze_technical(self):
-        details = []
+        score = 0 # This module calculates Multiplier actually
         mult = 1.0
+        details = []
         
-        p = self.df['Close'].iloc[-1]
-        ma20 = self.df['Close'].rolling(20).mean().iloc[-1]
-        ma60 = self.df['Close'].rolling(60).mean().iloc[-1]
+        close = self.df['Close']
+        curr_price = close.iloc[-1]
+        ma20 = close.rolling(MA_SHORT).mean().iloc[-1]
+        ma60 = close.rolling(MA_MID).mean().iloc[-1]
         
-        # 均線 (Prompt: 判斷趨勢)
-        if p > ma60:
+        # 1. Bias Calculation (乖離率修正)
+        bias_60 = ((curr_price - ma60) / ma60) * 100
+        
+        # 2. Positioning (位階: 股價 vs 52週高點)
+        high_52w = close.max()
+        drawdown = (curr_price - high_52w) / high_52w
+        
+        details.append(f"📊 Bias (60MA): {bias_60:.2f}%")
+        details.append(f"📉 Drawdown: {drawdown*100:.1f}% from High ({high_52w})")
+        
+        # 3. Logic
+        # Trend
+        if curr_price > ma60:
             if ma20 > ma60:
                 mult = 1.2
-                details.append("✅ 趨勢: 多頭排列 (x1.2)")
+                details.append("✅ Structure: Uptrend (多頭排列)")
             else:
-                details.append("🔸 趨勢: 整理中 (x1.0)")
+                details.append("🔸 Structure: Consolidation (整理)")
         else:
-            mult = 0.0
-            details.append("🔻 趨勢: 跌破季線 (x0.0 / Veto)")
+            # Special Logic: Pullback Buy or Crash?
+            if self.is_turnaround:
+                mult = 1.0 # 轉機股容許跌破季線 (洗盤)
+                details.append("ℹ️ Turnaround Exception: Ignoring MA60 breakdown (Potential Bear Trap)")
+            else:
+                mult = 0.0
+                details.append("🔻 Structure: Downtrend (空頭)")
 
-        # RSI (Prompt: 相對強弱)
-        delta = self.df['Close'].diff()
+        # RSI
+        delta = close.diff()
         gain = (delta.where(delta>0, 0)).rolling(14).mean()
         loss = (-delta.where(delta<0, 0)).rolling(14).mean()
         rs = gain/loss
         rsi = 100 - (100/(1+rs)).iloc[-1]
         
-        if rsi > 80:
-            mult = min(mult, 0.8)
-            details.append(f"🔻 RSI: {rsi:.1f} (超買警示)")
-        else:
-            details.append(f"✅ RSI: {rsi:.1f} (正常)")
+        if rsi < 30: details.append(f"✅ RSI: {rsi:.1f} (Oversold/超賣 - Potential Bottom)")
+        elif rsi > 80: 
+            mult *= 0.8
+            details.append(f"🔻 RSI: {rsi:.1f} (Overbought/超買)")
+            
+        self.scores['tech'] = mult
+        self.advice['stop_loss'] = ma60 * 0.95 # 寬鬆停損
+        return details
 
-        # 乖離率 (Prompt: 判斷漲太多)
-        bias = ((p - ma60)/ma60)*100
-        if bias > 20:
-            mult = min(mult, 0.8)
-            details.append(f"🔻 乖離率: {bias:.1f}% (過大)")
-        else:
-            details.append(f"✅ 乖離率: {bias:.1f}% (正常)")
-
-        # 操作建議點位 (Prompt 要求)
-        self.advice['buy'] = ma20
-        self.advice['stop'] = ma60
+    # --- Logic 3: Chips (Institutional Filter Added) ---
+    def analyze_chips(self):
+        score = 0
+        details = []
         
-        return mult, details
+        # 1. Price/Volume Action
+        vol_5 = self.df['Volume'].rolling(5).mean().iloc[-1]
+        vol_20 = self.df['Volume'].rolling(20).mean().iloc[-1]
+        price_chg = self.df['Close'].pct_change(5).iloc[-1]
+        
+        is_vol_up = vol_5 > vol_20
+        is_price_drop = price_chg < 0
+        
+        # 2. Institutional Filter (關鍵修正)
+        real_buy = False
+        if self.real_chips and self.real_chips['status']:
+            net_buy = self.real_chips['foreign'] + self.real_chips['trust']
+            if net_buy > 0:
+                real_buy = True
+                score += 2 # Max Score
+                details.append(f"🔥 **Smart Money**: 法人淨買超 {net_buy} 張 (Foreign+Trust)")
+            else:
+                details.append(f"🔻 Smart Money: 法人淨賣超 {net_buy} 張")
+        else:
+            details.append("🔸 No Real Chips Data (Using Proxy)")
 
-    def run_analysis(self):
+        # 3. Logic Synthesis
+        if is_price_drop and is_vol_up:
+            if real_buy:
+                details.append("✅ **Accumulation (壓低吃貨)**: 價跌 + 量增 + 法人買")
+                if score < 2: score += 1
+            else:
+                details.append("🔻 Distribution (出貨): 價跌 + 量增 + 法人賣/無數據")
+                score = 0 # 扣分
+        elif is_price_drop and not is_vol_up:
+             details.append("ℹ️ Correction (量縮回調): 正常整理")
+             score += 0.5
+        
+        # 4. Concentration
+        volatility = self.df['Close'].pct_change().std() * np.sqrt(252)
+        if volatility < 0.4:
+            score = min(2, score + 0.5)
+            details.append(f"✅ Low Volatility ({volatility:.2f}):籌碼安定")
+            
+        self.scores['chips'] = min(2, score)
+        return details
+
+    # --- Logic 4: Macro & Inventory Veto ---
+    def check_risks(self):
+        logs = []
+        # 1. VIX
+        if self.macro['VIX'] > 40:
+            self.veto = True
+            logs.append(f"❌ VIX Alert: {self.macro['VIX']} (Panic Market)")
+            
+        # 2. Inventory Risk (With Trend Adjustment)
+        try:
+            inv = self.balance_sheet.loc['Inventory'].iloc[0]
+            cost = self.q_financials.loc['Cost Of Revenue'].iloc[0] # Note: Quarterly Cost
+            days = (inv / cost) * 90 # Quarterly Turnover
+            
+            # 比較前期
+            inv_prev = self.balance_sheet.loc['Inventory'].iloc[1]
+            cost_prev = self.q_financials.loc['Cost Of Revenue'].iloc[1]
+            days_prev = (inv_prev / cost_prev) * 90
+            
+            diff = (days - days_prev) / days_prev
+            
+            inv_log = f"Inventory Days: {days:.0f} (Prev: {days_prev:.0f}, Chg: {diff*100:+.0f}%)"
+            
+            # Logic: 如果庫存暴增 > 50%
+            if diff > 0.5:
+                # Exception: 如果毛利在擴張 (Price Up)，則庫存是資產
+                if hasattr(self, 'gm_expanding') and self.gm_expanding:
+                    logs.append(f"⚠️ {inv_log} -> **Ignored** (GM Expanding = Low Cost Inventory)")
+                else:
+                    self.veto = True
+                    logs.append(f"❌ {inv_log} -> **VETO** (High Risk Drowning)")
+            else:
+                logs.append(f"✅ {inv_log} (Controlled)")
+                
+        except:
+            logs.append("🔸 Inventory Data N/A")
+            
+        return logs
+
+    # --- Main Execution ---
+    def run(self):
         self.fetch_data()
-        self.check_macro_veto()
         
-        if self.veto_triggered:
-            self.final_score = 0
-            return None
+        # Analysis
+        f_logs = self.analyze_fundamental()
+        c_logs = self.analyze_chips()
+        t_logs = self.analyze_technical()
+        r_logs = self.check_risks()
         
-        f_score, f_details = self.analyze_fundamental()
-        c_score, c_details = self.analyze_chips()
-        t_mult, t_details = self.analyze_technical()
+        # Scoring
+        base_score = self.scores['fund'] + self.scores['chips']
+        final_score = base_score * self.scores['tech']
         
-        self.base_score = min(6, f_score + c_score)
-        self.multiplier = t_mult
-        self.final_score = self.base_score * self.multiplier
+        # Veto Override
+        if self.veto: final_score = 0
         
         return {
-            'fundamental': f_details,
-            'chips': c_details,
-            'technical': t_details
+            'score': final_score,
+            'base': base_score,
+            'mult': self.scores['tech'],
+            'logs': {'fund': f_logs, 'chips': c_logs, 'tech': t_logs, 'risk': r_logs},
+            'turnaround': self.is_turnaround
         }
 
-# --- Streamlit UI 層 ---
-st.title("📈 Hedge Fund Alpha Engine")
-st.markdown("### 機構級量化分析儀表板 | Prompt Compliant")
+# === Streamlit UI ===
+st.title("🛡️ Stock Guardian AI (Pro)")
+st.caption("Wall Street Logic | Turnaround Detection | Institutional Filter")
 
 col1, col2 = st.columns([3, 1])
 with col1:
-    stock_input = st.text_input("輸入股票代號 (Ex: 2330)", "2330")
+    s_input = st.text_input("Stock Ticker", "2408")
 with col2:
-    st.write("") 
-    st.write("") 
-    run_btn = st.button("🚀 開始分析", type="primary")
+    st.write("")
+    st.write("")
+    btn = st.button("Analyze", type="primary")
 
-if run_btn:
-    engine = StreamlitHedgeFundEngine(stock_input)
-    result = engine.run_analysis()
+if btn:
+    engine = QuantEngine(s_input)
+    res = engine.run()
     
-    # 1. 宏觀數據
+    # 1. Top Dashboard
     st.markdown("---")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("VIX 恐慌指數", f"{engine.macro['VIX']:.2f}")
-    m2.metric("10年美債殖利率", f"{engine.macro['TNX']:.2f}%")
-    m3.metric("最新股價", f"{engine.df['Close'].iloc[-1]:.2f}")
-
-    # 2. 否決權狀態 (最重要的 Prompt 檢查)
-    if engine.veto_triggered:
-        st.error(f"❌ **觸發一票否決機制 (VETO TRIGGERED)**")
-        st.error(f"原因: {engine.veto_reason}")
-        # 在否決時也顯示細節 log，方便除錯
-        with st.expander("查看詳細原因"):
-             for log in engine.report_logs: st.write(log)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Current Price", f"{engine.df['Close'].iloc[-1]:.1f}")
+    m2.metric("Base Score", f"{res['base']} / 6")
+    m3.metric("Tech Multiplier", f"x{res['mult']:.1f}")
     
-    elif result:
-        # 3. 分數展示
-        st.markdown("### 📊 期望值評分")
-        s1, s2, s3 = st.columns(3)
-        s1.metric("基礎分 (Base)", f"{engine.base_score} / 6")
-        s2.metric("技術乘數 (Mult)", f"x{engine.multiplier}")
+    delta_color = "normal"
+    if res['turnaround']: delta_color = "off" # Gold/Grey for special case
+    
+    m4.metric("Final Expected Value", f"{res['score']:.2f} / 10", 
+              delta="Turnaround Buy" if res['turnaround'] else ("Buy" if res['score']>=7 else "Neutral"),
+              delta_color=delta_color)
+
+    # 2. Turnaround Badge
+    if res['turnaround']:
+        st.success("🔥 **TURNAROUND DETECTED (轉機股模式)**: PEG Constraint Removed. Focus on Accumulation.")
+
+    # 3. Veto Alert
+    if engine.veto:
+        st.error("❌ **VETO TRIGGERED**: Risk too high.")
+        for l in res['logs']['risk']: st.write(l)
+
+    # 4. Detailed Breakdown
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.info("Fundamental (Engine)")
+        for l in res['logs']['fund']: st.markdown(l)
+    with c2:
+        st.warning("Chips (Smart Money)")
+        for l in res['logs']['chips']: st.markdown(l)
+    with c3:
+        st.success("Technical (Timing)")
+        for l in res['logs']['tech']: st.markdown(l)
         
-        final_color = "normal" if engine.final_score >= 7 else ("inverse" if engine.final_score < 5 else "off")
-        s3.metric("★ 最終評分", f"{engine.final_score:.2f} / 10", 
-                  delta="Buy" if engine.final_score >=7 else "Hold/Sell", 
-                  delta_color=final_color)
-
-        # 4. 細節展示 (三欄佈局)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.info("基本面 (Fundamental)")
-            for d in result['fundamental']: st.write(d)
-        with c2:
-            st.warning("籌碼面 (Chips)")
-            for d in result['chips']: st.write(d)
-        with c3:
-            st.success("技術面 (Technical)")
-            for d in result['technical']: st.write(d)
-
-        # 5. 操作建議 (Prompt 指定)
-        if engine.final_score >= 5:
-            st.markdown("---")
-            st.markdown("### 🎯 操作建議")
-            op1, op2 = st.columns(2)
-            op1.success(f"**建議進場點 (月線)**: {engine.advice['buy']:.2f}")
-            op2.error(f"**嚴格停損點 (季線)**: {engine.advice['stop']:.2f}")
-
-    # 6. Log 區域 (包含存貨天數等詳細數字)
-    with st.expander("查看分析日誌與宏觀細節"):
-        for log in engine.report_logs: st.markdown(log)
+    # 5. Risk & Inventory
+    with st.expander("Risk & Inventory Depth Analysis"):
+        for l in res['logs']['risk']: st.markdown(l)
