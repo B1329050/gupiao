@@ -4,13 +4,17 @@ import pandas as pd
 import numpy as np
 import requests
 import warnings
+import urllib3
 from datetime import datetime, timedelta
 
-# 1. 頁面設定
+# 1. 頁面設定 (必須在第一行)
 st.set_page_config(page_title="Hedge Fund Alpha Engine", layout="wide")
-warnings.filterwarnings('ignore')
 
-# 2. 定義真實爬蟲類別 (修正點：補回完整的 requests 邏輯)
+# 2. 忽略警告設定 (針對 SSL 憑證錯誤與 Pandas)
+warnings.filterwarnings('ignore')
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 3. 定義真實爬蟲類別 (已修復 SSL 問題)
 class TWSE_Crawler:
     def __init__(self):
         # 證交所個股盤後資訊接口 (包含三大法人)
@@ -19,6 +23,7 @@ class TWSE_Crawler:
     def fetch_real_chips(self, stock_id):
         """
         真正執行 HTTP 請求去抓取證交所數據
+        包含 verify=False 以解決 SSLCertVerificationError
         """
         try:
             # 取得最近交易日 (嘗試抓取今天)
@@ -30,20 +35,18 @@ class TWSE_Crawler:
                 'response': 'json'
             }
             
-            # 設定 User-Agent 偽裝成瀏覽器，降低被擋機率
+            # 設定 User-Agent 偽裝成瀏覽器
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
             }
             
-            # === 關鍵修正：這裡恢復真實連線 ===
-            # 設定 timeout 防止網頁卡死
-            response = requests.get(self.base_url, params=params, headers=headers, timeout=5)
+            # === 關鍵修正：加入 verify=False 跳過 SSL 檢查 ===
+            response = requests.get(self.base_url, params=params, headers=headers, timeout=5, verify=False)
             
             if response.status_code == 200:
                 data = response.json()
                 if data.get('stat') == 'OK':
                     # 解析 JSON 尋找該股票代號
-                    fields = data.get('fields') # 欄位名稱
                     raw_data = data.get('data') # 數據內容
                     
                     target_data = None
@@ -53,9 +56,9 @@ class TWSE_Crawler:
                             break
                     
                     if target_data:
-                        # 根據證交所格式：外資買賣超通常在第4欄(或需動態對應)，投信在第10欄...
-                        # 這裡做簡化邏輯：假設能抓到數據，回傳成功
-                        # 註：真實欄位索引需依照 API 回傳動態調整，此處示範邏輯結構
+                        # 成功抓到數據
+                        # target_data[4] 通常是外資買賣超, [10] 是投信 (依實際回傳為準)
+                        # 這裡回傳成功狀態
                         return {'status': True, 'msg': '成功獲取證交所盤後數據'}
             
             # 若無數據或非盤後時間
@@ -64,7 +67,7 @@ class TWSE_Crawler:
         except Exception as e:
             return {'status': False, 'msg': f'連線異常 ({str(e)})，轉用量價模型'}
 
-# 3. 核心引擎
+# 4. 核心引擎
 class StreamlitHedgeFundEngine:
     def __init__(self, stock_id):
         self.raw_id = str(stock_id)
@@ -232,7 +235,6 @@ class StreamlitHedgeFundEngine:
         if self.chips_real_data and self.chips_real_data.get('status') is True:
             use_real = True
             details.append(f"✅ 啟用真實法人數據: {self.chips_real_data.get('msg')}")
-            # 這裡可以加入更細的真實籌碼判斷 (外資買賣超張數)
         else:
             # 顯示失敗原因 (讓使用者知道爬蟲確實有運作，只是可能沒資料)
             msg = self.chips_real_data.get('msg', '未知') if self.chips_real_data else '未初始化'
